@@ -1,0 +1,5 @@
+sqlalchemy>=2.0.30
+openpyxl>=3.1.5
+python-dotenv>=1.0.1
+requests>=2.32.3
+yt-dlp[default]>=2025.8.11
