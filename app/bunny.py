@@ -12,6 +12,13 @@ log = logging.getLogger(__name__)
 
 STREAM_API = "https://video.bunnycdn.com"
 
+# Logical folders inside each creator (Stream collections are flat; we encode
+# hierarchy in the collection name as "CreatorName/videos", etc.)
+FOLDER_VIDEOS = "videos"
+FOLDER_SHORTS = "shorts"
+FOLDER_PLAYLISTS = "playlists"
+CREATOR_FOLDERS = (FOLDER_VIDEOS, FOLDER_SHORTS, FOLDER_PLAYLISTS)
+
 
 class _ProgressReader:
     """File reader that logs upload progress so long PUTs don't look stuck."""
@@ -68,7 +75,15 @@ class _ProgressReader:
 
 
 class BunnyStream:
-    """Upload videos into Bunny Stream, one collection per creator."""
+    """
+    Upload into Bunny Stream using creator folder collections:
+
+        {CreatorName}/videos
+        {CreatorName}/shorts
+        {CreatorName}/playlists
+
+    Stream has no nested collections API, so the slash is part of the name.
+    """
 
     def __init__(self, settings: Settings) -> None:
         if not settings.bunny_stream_library_id or not settings.bunny_stream_api_key:
@@ -89,16 +104,51 @@ class BunnyStream:
     def _url(self, path: str) -> str:
         return f"{STREAM_API}/library/{self.library_id}/{path.lstrip('/')}"
 
-    def ensure_creator_collection(self, creator_name: str) -> str:
-        """Return collection GUID for this creator, creating it if needed."""
-        name = (creator_name or "Unknown Creator").strip() or "Unknown Creator"
-        cached = self._collection_cache.get(name.lower())
+    @staticmethod
+    def collection_name(creator_name: str, folder: str) -> str:
+        root = (creator_name or "Unknown Creator").strip() or "Unknown Creator"
+        folder = (folder or FOLDER_VIDEOS).strip().strip("/")
+        if folder not in CREATOR_FOLDERS:
+            raise ValueError(f"Unknown folder {folder!r}; expected one of {CREATOR_FOLDERS}")
+        return f"{root}/{folder}"
+
+    def collection_exists(self, collection_id: str) -> bool:
+        if not collection_id:
+            return False
+        response = self.session.get(
+            self._url(f"collections/{collection_id}"),
+            timeout=60,
+        )
+        return response.status_code == 200
+
+    def ensure_folder_collection(
+        self,
+        creator_name: str,
+        folder: str,
+        *,
+        preferred_id: str | None = None,
+    ) -> str:
+        """Return collection GUID for CreatorName/{folder}, creating if needed."""
+        name = self.collection_name(creator_name, folder)
+        cache_key = name.casefold()
+        cached = self._collection_cache.get(cache_key)
         if cached:
             return cached
 
+        if preferred_id and self.collection_exists(preferred_id):
+            self._collection_cache[cache_key] = preferred_id
+            log.info("Using stored Stream collection %r (%s)", name, preferred_id)
+            return preferred_id
+        if preferred_id:
+            log.warning(
+                "Stored Stream collection %s for %r no longer exists; recreating",
+                preferred_id,
+                name,
+            )
+
         existing = self._find_collection_by_name(name)
         if existing:
-            self._collection_cache[name.lower()] = existing
+            self._collection_cache[cache_key] = existing
             log.info("Using existing Stream collection %r (%s)", name, existing)
             return existing
 
@@ -115,9 +165,28 @@ class BunnyStream:
         collection_id = data.get("guid") or data.get("Guid")
         if not collection_id:
             raise RuntimeError(f"Create collection returned no guid: {data}")
-        self._collection_cache[name.lower()] = collection_id
+        self._collection_cache[cache_key] = collection_id
         log.info("Created Stream collection %r (%s)", name, collection_id)
         return collection_id
+
+    def ensure_creator_folders(self, creator_name: str) -> dict[str, str]:
+        """Create/find videos, shorts, and playlists collections for a creator."""
+        return {
+            folder: self.ensure_folder_collection(creator_name, folder)
+            for folder in CREATOR_FOLDERS
+        }
+
+    # Backward-compatible alias: old code meant the creator's main (videos) folder.
+    def ensure_creator_collection(
+        self,
+        creator_name: str,
+        *,
+        preferred_id: str | None = None,
+        folder: str = FOLDER_VIDEOS,
+    ) -> str:
+        return self.ensure_folder_collection(
+            creator_name, folder, preferred_id=preferred_id
+        )
 
     def _find_collection_by_name(self, name: str) -> str | None:
         page = 1
@@ -155,11 +224,7 @@ class BunnyStream:
         title: str,
         collection_id: str,
     ) -> dict[str, str]:
-        """
-        Create a Stream video in the creator collection, then upload the file.
-
-        Returns dict with video_id, collection_id, play_url, embed_url.
-        """
+        """Create a Stream video in the given collection, then upload the file."""
         create = self.session.post(
             self._url("videos"),
             json={
@@ -187,8 +252,6 @@ class BunnyStream:
             collection_id,
         )
 
-        # connect timeout 60s; read timeout 120s between network reads of the response.
-        # Large uploads can take many minutes; progress logs show activity while sending.
         with _ProgressReader(local_path, file_size, local_path.name) as body:
             upload = self.session.put(
                 self._url(f"videos/{video_id}"),

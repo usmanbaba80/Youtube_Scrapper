@@ -56,6 +56,20 @@ def build_video_id(category_id: int, creator_id: int, serial: int) -> str:
     return f"{category_id}{creator_id}{serial:03d}"
 
 
+def build_short_id(category_id: int, creator_id: int, serial: int) -> str:
+    """S{category}{creator}{serial:03d} e.g. S1100001."""
+    if serial < 1 or serial > 999:
+        raise ValueError(f"serial must be 1..999, got {serial}")
+    return f"S{category_id}{creator_id}{serial:03d}"
+
+
+def build_playlist_id(category_id: int, creator_id: int, serial: int) -> str:
+    """P{category}{creator}{serial:02d} e.g. P110001."""
+    if serial < 1 or serial > 99:
+        raise ValueError(f"serial must be 1..99, got {serial}")
+    return f"P{category_id}{creator_id}{serial:02d}"
+
+
 # Backward-compatible alias
 build_app_video_id = build_video_id
 
@@ -151,3 +165,11 @@ def popular_videos_url(channel_url: str) -> str:
 
 def watch_url(video_id: str) -> str:
     return f"https://www.youtube.com/watch?v={video_id}"
+
+
+def shorts_url(video_id: str) -> str:
+    return f"https://www.youtube.com/shorts/{video_id}"
+
+
+def playlist_url(playlist_id: str) -> str:
+    return f"https://www.youtube.com/playlist?list={playlist_id}"

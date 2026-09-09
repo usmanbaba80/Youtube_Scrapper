@@ -59,6 +59,9 @@ class Settings:
     excel_path: Path
     download_dir: Path
     max_videos_per_channel: int
+    max_shorts_per_channel: int
+    max_playlists_per_channel: int
+    max_playlist_items: int
     scrape_fetch_limit: int
     cookies_file: Path | None
     cookies_from_browser: str | None
@@ -82,6 +85,9 @@ def load_settings() -> Settings:
             db_url = "sqlite:///" + (PROJECT_ROOT / db_path).as_posix()
 
     max_videos = _env_int("MAX_VIDEOS_PER_CHANNEL", 100)
+    max_shorts = _env_int("MAX_SHORTS_PER_CHANNEL", 50)
+    max_playlists = _env_int("MAX_PLAYLISTS_PER_CHANNEL", 10)
+    max_playlist_items = _env_int("MAX_PLAYLIST_ITEMS", 100)
     return Settings(
         youtube_api_key=_env("YOUTUBE_API_KEY"),
         bunny_stream_library_id=_env("BUNNY_STREAM_LIBRARY_ID"),
@@ -94,6 +100,9 @@ def load_settings() -> Settings:
         excel_path=excel,
         download_dir=download_dir,
         max_videos_per_channel=max_videos,
+        max_shorts_per_channel=max(0, min(max_shorts, 999)),
+        max_playlists_per_channel=max(0, min(max_playlists, 99)),
+        max_playlist_items=max(1, min(max_playlist_items, 500)),
         scrape_fetch_limit=max(max_videos + 80, 180),
         cookies_file=_optional_path("YTDLP_COOKIES"),
         cookies_from_browser=_env("YTDLP_COOKIES_FROM_BROWSER") or None,

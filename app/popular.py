@@ -7,7 +7,14 @@ from urllib.parse import urlparse, urlunparse
 
 import requests
 
-from app.utils import channel_handle, extract_video_id, is_short_url, normalize_channel_url, watch_url
+from app.utils import (
+    channel_handle,
+    extract_video_id,
+    is_short_url,
+    normalize_channel_url,
+    shorts_url,
+    watch_url,
+)
 
 log = logging.getLogger(__name__)
 
@@ -38,14 +45,24 @@ LATEST_SORT_MARKER = "VlCQSUzRCUzRA"
 POPULAR_SORT_MARKER = "VlBZyUzRCUzRA"
 # Innertube params for the channel Videos tab (default/Latest order).
 VIDEOS_TAB_PARAMS = "EgZ2aWRlb3PyBgQKAjoA"
+# Innertube params for the channel Shorts tab.
+SHORTS_TAB_PARAMS = "EgZzaG9ydHPyBgUKA5oBAA%3D%3D"
 
 
-def _videos_page_url(channel_url: str) -> str:
+def _tab_page_url(channel_url: str, tab: str) -> str:
     base = normalize_channel_url(channel_url)
     parsed = urlparse(base)
     return urlunparse(
-        (parsed.scheme, parsed.netloc, parsed.path.rstrip("/") + "/videos", "", "", "")
+        (parsed.scheme, parsed.netloc, parsed.path.rstrip("/") + f"/{tab}", "", "", "")
     )
+
+
+def _videos_page_url(channel_url: str) -> str:
+    return _tab_page_url(channel_url, "videos")
+
+
+def _shorts_page_url(channel_url: str) -> str:
+    return _tab_page_url(channel_url, "shorts")
 
 
 def _session() -> requests.Session:
@@ -179,11 +196,12 @@ def _append_videos(
     limit: int,
     channel_id: str | None,
     handle: str | None,
+    as_shorts: bool = False,
 ) -> None:
     titles = _title_map(payload)
     for video_id in _extract_video_ids(payload):
-        url = watch_url(video_id)
-        if is_short_url(url) or video_id in seen:
+        url = shorts_url(video_id) if as_shorts else watch_url(video_id)
+        if (not as_shorts and is_short_url(url)) or video_id in seen:
             continue
         seen.add(video_id)
         videos.append(
@@ -209,6 +227,7 @@ def _paginate_continuation(
     limit: int,
     channel_id: str | None,
     handle: str | None,
+    as_shorts: bool = False,
 ) -> tuple[list[dict], int]:
     videos: list[dict] = []
     seen: set[str] = set()
@@ -234,13 +253,14 @@ def _paginate_continuation(
             limit=limit,
             channel_id=channel_id,
             handle=handle,
+            as_shorts=as_shorts,
         )
         token = _pagination_token(payload)
 
     return videos, pages
 
 
-def _browse_videos_tab(
+def _browse_tab(
     http: requests.Session,
     *,
     api_key: str,
@@ -249,6 +269,8 @@ def _browse_videos_tab(
     channel_id: str,
     limit: int,
     handle: str | None,
+    tab_params: str,
+    as_shorts: bool = False,
 ) -> tuple[list[dict], int]:
     endpoint = "https://www.youtube.com/youtubei/v1/browse"
     browse = http.post(
@@ -258,7 +280,7 @@ def _browse_videos_tab(
         json={
             "context": context,
             "browseId": channel_id,
-            "params": VIDEOS_TAB_PARAMS,
+            "params": tab_params,
         },
         timeout=45,
     )
@@ -274,6 +296,7 @@ def _browse_videos_tab(
         limit=limit,
         channel_id=channel_id,
         handle=handle,
+        as_shorts=as_shorts,
     )
     pages = 1
 
@@ -296,10 +319,62 @@ def _browse_videos_tab(
             limit=limit,
             channel_id=channel_id,
             handle=handle,
+            as_shorts=as_shorts,
         )
         token = _pagination_token(payload)
 
     return videos, pages
+
+
+def _browse_videos_tab(
+    http: requests.Session,
+    *,
+    api_key: str,
+    context: dict,
+    headers: dict,
+    channel_id: str,
+    limit: int,
+    handle: str | None,
+) -> tuple[list[dict], int]:
+    return _browse_tab(
+        http,
+        api_key=api_key,
+        context=context,
+        headers=headers,
+        channel_id=channel_id,
+        limit=limit,
+        handle=handle,
+        tab_params=VIDEOS_TAB_PARAMS,
+        as_shorts=False,
+    )
+
+
+def _innertube_context_from_html(html: str, channel_url: str) -> tuple[str, dict, dict, str | None, str | None]:
+    api_key_match = API_KEY_RE.search(html)
+    version_match = CLIENT_VERSION_RE.search(html)
+    if not api_key_match or not version_match:
+        raise RuntimeError(
+            "Could not read YouTube Innertube config from channel page "
+            "(page layout may have changed or a consent wall was returned)"
+        )
+    api_key = api_key_match.group(1)
+    client_version = version_match.group(1)
+    channel_id = _extract_channel_id(html)
+    handle = _extract_handle(html, channel_url)
+    context = {
+        "client": {
+            "clientName": "WEB",
+            "clientVersion": client_version,
+            "hl": "en",
+            "gl": "US",
+        }
+    }
+    headers = {
+        "Content-Type": "application/json",
+        "X-Youtube-Client-Name": "1",
+        "X-Youtube-Client-Version": client_version,
+    }
+    return api_key, context, headers, channel_id, handle
 
 
 def fetch_popular_videos(channel_url: str, limit: int = 100) -> list[dict]:
@@ -315,34 +390,11 @@ def fetch_popular_videos(channel_url: str, limit: int = 100) -> list[dict]:
     response.raise_for_status()
     html = response.text
 
-    api_key_match = API_KEY_RE.search(html)
-    version_match = CLIENT_VERSION_RE.search(html)
-    if not api_key_match or not version_match:
-        raise RuntimeError(
-            "Could not read YouTube Innertube config from Videos tab "
-            "(page layout may have changed or a consent wall was returned)"
-        )
-
-    api_key = api_key_match.group(1)
-    client_version = version_match.group(1)
-    channel_id = _extract_channel_id(html)
-    handle = _extract_handle(html, channel_url)
+    api_key, context, headers, channel_id, handle = _innertube_context_from_html(
+        html, channel_url
+    )
     tokens = _extract_sort_tokens(html)
     popular_token = tokens.get("Popular")
-
-    context = {
-        "client": {
-            "clientName": "WEB",
-            "clientVersion": client_version,
-            "hl": "en",
-            "gl": "US",
-        }
-    }
-    headers = {
-        "Content-Type": "application/json",
-        "X-Youtube-Client-Name": "1",
-        "X-Youtube-Client-Version": client_version,
-    }
 
     if popular_token:
         videos, pages = _paginate_continuation(
@@ -389,3 +441,46 @@ def fetch_popular_videos(channel_url: str, limit: int = 100) -> list[dict]:
         pages,
     )
     return videos
+
+
+def fetch_channel_shorts(channel_url: str, limit: int = 50) -> list[dict]:
+    """Fetch Shorts from the channel Shorts tab via Innertube browse."""
+    if limit <= 0:
+        return []
+
+    page_url = _shorts_page_url(channel_url)
+    http = _session()
+    response = http.get(page_url, timeout=45)
+    response.raise_for_status()
+    html = response.text
+
+    api_key, context, headers, channel_id, handle = _innertube_context_from_html(
+        html, channel_url
+    )
+    if not channel_id:
+        # Shorts page sometimes lacks channelId; fall back to Videos page.
+        videos_html = http.get(_videos_page_url(channel_url), timeout=45)
+        videos_html.raise_for_status()
+        channel_id = _extract_channel_id(videos_html.text)
+        handle = handle or _extract_handle(videos_html.text, channel_url)
+    if not channel_id:
+        raise RuntimeError(f"Could not resolve channel ID for Shorts scrape: {page_url}")
+
+    shorts, pages = _browse_tab(
+        http,
+        api_key=api_key,
+        context=context,
+        headers=headers,
+        channel_id=channel_id,
+        limit=limit,
+        handle=handle,
+        tab_params=SHORTS_TAB_PARAMS,
+        as_shorts=True,
+    )
+    log.info(
+        "Fetched %s shorts from %s (%s pages)",
+        len(shorts),
+        page_url,
+        pages,
+    )
+    return shorts

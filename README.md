@@ -1,6 +1,8 @@
 # YouTube Popular Videos → Bunny Stream
 
-Reads your Excel workbook (one sheet per category), stores channels in SQLite, scrapes the first 100 **Popular** long-form videos from each channel, pulls metadata in bulk from the YouTube Data API, then downloads **one channel at a time** into a local folder and uploads that channel’s files to **Bunny Stream** in a separate step.
+Reads your Excel workbook (one sheet per category), stores creators in SQLite, scrapes
+**Popular** long-form videos, **Shorts**, and **playlists** per creator, pulls metadata
+from the YouTube Data API, then downloads long-form videos and uploads them to **Bunny Stream**.
 
 ## What it does
 
@@ -8,23 +10,29 @@ Reads your Excel workbook (one sheet per category), stores channels in SQLite, s
    - `YouTube Channel`
    - `Monetization Model`
    - `Channel links`
-2. **Scrape** — opens the channel Videos tab and uses YouTube’s **Popular** chip
-   (Innertube continuation). This is required because `?sort=p` / yt-dlp currently
-   fall back to Latest. Shorts and Live tabs are not used.
-3. **Metadata** — YouTube Data API `videos.list` in batches of 50 IDs. No API usage for listing or downloading.
-4. **Transfer** — for each video: **download → upload to Bunny Stream → delete local**.
-   Runs a few videos in parallel (`TRANSFER_CONCURRENCY`) so disk stays limited.
-   Each creator gets a Stream **collection**; videos go into that collection.
+   - `Id` (creator id)
+2. **Scrape**
+   - Popular long-form videos (Videos tab / Innertube), default 100
+   - Shorts tab (Innertube), default 50 → table `shorts`
+   - Channel playlists (Data API), default 10 → tables `playlists` + `playlist_items`
+3. **Playlist reuse** — if a playlist video already exists in that creator’s `videos`
+   (or `shorts`), the item is **linked** (`reuse_source=video|short`). No extra
+   metadata/download/upload for that asset; Bunny file from the linked row is reused.
+   Unlinked playlist-only items get metadata only (`transfer_status=skipped`).
+4. **Metadata** — Data API for videos, shorts, playlists, and unlinked playlist items.
+5. **Transfer** — download → Bunny Stream → delete local, into folder collections:
+   - `{CreatorName}/videos`
+   - `{CreatorName}/shorts`
+   - `{CreatorName}/playlists` (only playlist items **not** already in videos/shorts)
 
-Bunny Stream layout:
+Bunny Stream has no nested folders API, so names use a slash (`Creator/videos`).
+In the Stream library UI they appear as separate collections under that naming.
 
-```text
-Stream Library
-  └── Collection: {creator name}
-        ├── video 1
-        ├── video 2
-        └── ...
-```
+### IDs
+
+- Videos: `{category}{creator}{serial:03d}` → `1100001`
+- Shorts: `S{category}{creator}{serial:03d}` → `S1100001`
+- Playlists: `P{category}{creator}{serial:02d}` → `P110001`
 
 ## Setup
 
@@ -40,75 +48,25 @@ Install [ffmpeg](https://ffmpeg.org/download.html) and [Deno](https://deno.land/
 
 Fill in `.env`:
 
-- `YOUTUBE_API_KEY` — Data API key for metadata only
-- `BUNNY_STREAM_LIBRARY_ID` — Stream library numeric ID
-- `BUNNY_STREAM_API_KEY` — Stream library API key (Stream → Library → API)
-- `BUNNY_STREAM_CDN_HOSTNAME` — optional, e.g. `vz-xxxx.b-cdn.net` for HLS URLs
-- `EXCEL_PATH` — path to the workbook (default `data/channels.xlsx`)
-
-Copy the Excel file to `data/channels.xlsx`.
-
-If YouTube blocks anonymous downloads, export `cookies.txt` (Netscape format) or set:
-
-```env
-YTDLP_COOKIES_FROM_BROWSER=chrome
-```
-
-Downloads prefer **1080p** (configurable via `YTDLP_MAX_HEIGHT`) using YouTube clients that still expose HD streams. Logs show `Selected format … (1080p)` per video. Already-downloaded low-quality files stay until you re-download with `--force`.
-
-### Excel IDs
-
-- Sheet name must end with `(category_id)`, e.g. `Kids - MiniMinds (1)` → category_id `1`
-- Column `Id` is the creator_id (e.g. `100`)
-- Each video gets `video_id` by joining `category_id` + `creator_id` + `serial` (3 digits):  
-  Example: `1` + `100` + `001` → **`1100001`**, `1100011`, and creator 101 → **`1101001`**
-  Videos also store `category_id` and `creator_id`.
+- `YOUTUBE_API_KEY` — Data API key (metadata + playlists)
+- `BUNNY_STREAM_LIBRARY_ID` / `BUNNY_STREAM_API_KEY`
+- `MAX_VIDEOS_PER_CHANNEL` / `MAX_SHORTS_PER_CHANNEL` / `MAX_PLAYLISTS_PER_CHANNEL`
 
 ## Commands
 
 ```powershell
 python main.py load-excel
-python main.py scrape
+python main.py scrape --force
 python main.py metadata
 python main.py transfer
 python main.py status
-```
-
-`transfer` = download → Bunny Stream upload → delete local (parallel, disk-safe).
-
-Optional separate steps still work: `download`, `upload`.
-
-Full pipeline:
-
-```powershell
-python main.py run
-```
-
-Useful flags:
-
-```powershell
-python main.py scrape --force
-python main.py transfer --channel-id 18
-python main.py transfer --retry-failed
-python main.py run --excel "C:\path\to\channels.xlsx"
-```
-
-`--force` re-scrapes creators already marked done.
-
-The job is resumable:
-- `transfer` continues from `pending` / leftover `downloaded`
-- use `--retry-failed` for errors
-
-Tune parallelism / disk use in `.env`:
-
-```env
-TRANSFER_CONCURRENCY=2
 ```
 
 ## Database
 
 Default: `data/scraper.db`
 
-- `categories` ← sheet name + category id from `(N)`
-- `creators` ← `creator_id` from Excel `Id`, name, URL, scrape status, Stream collection id
-- `videos` ← `video_id` (`{category}{creator}{serial}`), YouTube id, metadata, transfer status
+- `categories`, `creators`, `videos`
+- `shorts`, `playlists`, `playlist_items`
+
+New tables are created automatically on next `python main.py …`.

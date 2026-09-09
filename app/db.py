@@ -38,6 +38,31 @@ def make_engine(settings: Settings):
 
 def init_db(engine) -> None:
     Base.metadata.create_all(engine)
+    _migrate_sqlite_playlist_item_columns(engine)
+
+
+def _migrate_sqlite_playlist_item_columns(engine) -> None:
+    """Add transfer columns to playlist_items if the table predates them."""
+    if engine.dialect.name != "sqlite":
+        return
+    with engine.begin() as conn:
+        rows = conn.exec_driver_sql("PRAGMA table_info(playlist_items)").fetchall()
+        if not rows:
+            return
+        existing = {row[1] for row in rows}
+        alters = []
+        if "local_path" not in existing:
+            alters.append("ALTER TABLE playlist_items ADD COLUMN local_path VARCHAR(1000)")
+        if "bunny_path" not in existing:
+            alters.append("ALTER TABLE playlist_items ADD COLUMN bunny_path VARCHAR(1000)")
+        if "bunny_url" not in existing:
+            alters.append("ALTER TABLE playlist_items ADD COLUMN bunny_url VARCHAR(1000)")
+        if "file_size" not in existing:
+            alters.append("ALTER TABLE playlist_items ADD COLUMN file_size INTEGER")
+        if "uploaded_at" not in existing:
+            alters.append("ALTER TABLE playlist_items ADD COLUMN uploaded_at DATETIME")
+        for sql in alters:
+            conn.exec_driver_sql(sql)
 
 
 def reset_database(settings: Settings) -> Path:

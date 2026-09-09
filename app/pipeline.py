@@ -8,7 +8,7 @@ from sqlalchemy.orm import Session, sessionmaker
 from app.config import Settings
 from app.excel import load_excel
 from app.metadata import fetch_all_metadata
-from app.models import Category, Creator, Video
+from app.models import Category, Creator, Playlist, PlaylistItem, Short, Video
 from app.scraper import scrape_all_creators
 from app.transfer import download_videos, transfer_videos, upload_videos
 
@@ -42,11 +42,34 @@ def run_upload(session: Session, settings: Settings, **kwargs) -> None:
 
 def run_transfer(session: Session, settings: Settings, **kwargs) -> None:
     uploaded, failed, _skipped = transfer_videos(session, settings, **kwargs)
+    remaining = (
+        session.query(func.count(Video.id))
+        .filter(Video.is_short.is_(False), Video.transfer_status == "failed")
+        .scalar()
+        or 0
+    )
+    still_pending = (
+        session.query(func.count(Video.id))
+        .filter(
+            Video.is_short.is_(False),
+            Video.transfer_status.in_(["pending", "downloaded", "downloading", "uploading"]),
+        )
+        .scalar()
+        or 0
+    )
     log.info(
-        "Transfer finished: %s uploaded (download→upload→delete), %s failed",
+        "Transfer finished: %s uploaded (download→upload→delete), %s failed this run; "
+        "still not on Bunny: %s failed + %s pending/leftover",
         uploaded,
         failed,
+        remaining,
+        still_pending,
     )
+    if remaining or still_pending:
+        log.info(
+            "Run again later with: python main.py transfer --retry-failed "
+            "(after YouTube rate-limit cools down)"
+        )
 
 
 def run_all(
@@ -78,21 +101,71 @@ def run_all(
         )
 
 
+def _count_by(session: Session, model, column) -> list[tuple]:
+    return (
+        session.query(column, func.count(model.id))
+        .group_by(column)
+        .order_by(column.asc())
+        .all()
+    )
+
+
 def print_status(session: Session) -> None:
     categories = session.query(func.count(Category.id)).scalar() or 0
     creators = session.query(func.count(Creator.id)).scalar() or 0
-    videos = session.query(func.count(Video.id)).scalar() or 0
     print(f"Categories: {categories}")
     print(f"Creators:   {creators}")
     print("  scrape pending:", session.query(func.count(Creator.id)).filter(Creator.scrape_status == "pending").scalar())
     print("  scrape done:   ", session.query(func.count(Creator.id)).filter(Creator.scrape_status == "done").scalar())
     print("  scrape failed: ", session.query(func.count(Creator.id)).filter(Creator.scrape_status == "failed").scalar())
+
+    videos = session.query(func.count(Video.id)).scalar() or 0
     print(f"Videos:     {videos}")
-    print("  shorts skipped:", session.query(func.count(Video.id)).filter(Video.is_short.is_(True)).scalar())
-    print("  metadata pending:", session.query(func.count(Video.id)).filter(Video.metadata_status == "pending").scalar())
-    print("  metadata fetched:", session.query(func.count(Video.id)).filter(Video.metadata_status == "fetched").scalar())
-    print("  download pending:", session.query(func.count(Video.id)).filter(Video.transfer_status == "pending").scalar())
-    print("  downloaded:     ", session.query(func.count(Video.id)).filter(Video.transfer_status == "downloaded").scalar())
-    print("  uploaded:       ", session.query(func.count(Video.id)).filter(Video.transfer_status == "uploaded").scalar())
-    print("  transfer failed:", session.query(func.count(Video.id)).filter(Video.transfer_status == "failed").scalar())
-    print("  skipped:        ", session.query(func.count(Video.id)).filter(Video.transfer_status == "skipped").scalar())
+    for status, count in _count_by(session, Video, Video.transfer_status):
+        print(f"  transfer {status or '(null)'}: {count}")
+    print(
+        "  metadata pending:",
+        session.query(func.count(Video.id)).filter(Video.metadata_status == "pending").scalar(),
+    )
+    print(
+        "  metadata fetched:",
+        session.query(func.count(Video.id)).filter(Video.metadata_status == "fetched").scalar(),
+    )
+
+    shorts = session.query(func.count(Short.id)).scalar() or 0
+    print(f"Shorts:     {shorts}")
+    for status, count in _count_by(session, Short, Short.transfer_status):
+        print(f"  transfer {status or '(null)'}: {count}")
+    print(
+        "  metadata pending:",
+        session.query(func.count(Short.id)).filter(Short.metadata_status == "pending").scalar(),
+    )
+    print(
+        "  metadata fetched:",
+        session.query(func.count(Short.id)).filter(Short.metadata_status == "fetched").scalar(),
+    )
+
+    playlists = session.query(func.count(Playlist.id)).scalar() or 0
+    items = session.query(func.count(PlaylistItem.id)).scalar() or 0
+    print(f"Playlists:  {playlists}")
+    print(f"Playlist items: {items}")
+    print(
+        "  items linked to videos:",
+        session.query(func.count(PlaylistItem.id)).filter(PlaylistItem.reuse_source == "video").scalar(),
+    )
+    print(
+        "  items linked to shorts:",
+        session.query(func.count(PlaylistItem.id)).filter(PlaylistItem.reuse_source == "short").scalar(),
+    )
+    print(
+        "  items unlinked (metadata only):",
+        session.query(func.count(PlaylistItem.id)).filter(PlaylistItem.reuse_source == "none").scalar(),
+    )
+    print(
+        "  playlist metadata pending:",
+        session.query(func.count(Playlist.id)).filter(Playlist.metadata_status == "pending").scalar(),
+    )
+    print(
+        "  playlist metadata fetched:",
+        session.query(func.count(Playlist.id)).filter(Playlist.metadata_status == "fetched").scalar(),
+    )
