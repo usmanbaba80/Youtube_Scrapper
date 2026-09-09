@@ -7,12 +7,18 @@ from sqlalchemy.orm import Session, sessionmaker
 
 from app.config import Settings
 from app.excel import load_excel
+from app.export_json import export_jsons
 from app.metadata import fetch_all_metadata
 from app.models import Category, Creator, Playlist, PlaylistItem, Short, Video
 from app.scraper import scrape_all_creators
 from app.transfer import download_videos, transfer_videos, upload_videos
 
 log = logging.getLogger(__name__)
+
+
+def run_export_json(session: Session, settings: Settings, **kwargs) -> None:
+    paths = export_jsons(session, settings, **kwargs)
+    log.info("Export wrote %s creator folder(s)", len(paths))
 
 
 def run_load_excel(session: Session, settings: Settings) -> None:

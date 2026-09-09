@@ -8,11 +8,14 @@ __pycache__/
 .vscode/
 
 data/*.db
+data/*.db-wal
+data/*.db-shm
 data/*.db-journal
 data/*.xlsx
 data/*.xls
 !data/.gitkeep
-
 temp_downloads/
+
+data/exports/
 logs/
 *.log

@@ -11,6 +11,7 @@ from app.pipeline import (
     print_status,
     run_all,
     run_download,
+    run_export_json,
     run_load_excel,
     run_metadata,
     run_scrape,
@@ -45,13 +46,23 @@ def build_parser() -> argparse.ArgumentParser:
             "download",
             "upload",
             "transfer",
+            "export-json",
             "run",
             "status",
         ],
         help="Pipeline stage to run",
     )
     parser.add_argument("--excel", type=Path, help="Override Excel workbook path")
-    parser.add_argument("--channel-id", type=int, help="Only process this channels.id")
+    parser.add_argument(
+        "--channel-id",
+        type=int,
+        help="Only process this creators.id (DB row PK)",
+    )
+    parser.add_argument(
+        "--output-dir",
+        type=Path,
+        help="For export-json: folder to write creator JSON packs (default data/exports)",
+    )
     parser.add_argument(
         "--retry-failed",
         action="store_true",
@@ -120,6 +131,16 @@ def main() -> None:
                 settings,
                 retry_failed=args.retry_failed,
                 channel_id=args.channel_id,
+            )
+        elif args.command == "export-json":
+            out = args.output_dir
+            if out is not None and not out.is_absolute():
+                out = PROJECT_ROOT / out
+            run_export_json(
+                session,
+                settings,
+                channel_id=args.channel_id,
+                output_dir=out,
             )
         elif args.command == "status":
             print_status(session)
