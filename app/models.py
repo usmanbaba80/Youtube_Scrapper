@@ -3,6 +3,7 @@ from __future__ import annotations
 from datetime import datetime
 
 from sqlalchemy import (
+    BigInteger,
     Boolean,
     DateTime,
     ForeignKey,
@@ -93,9 +94,10 @@ class Video(Base):
     published_at: Mapped[str | None] = mapped_column(String(64), nullable=True)
     duration_iso: Mapped[str | None] = mapped_column(String(32), nullable=True)
     duration_seconds: Mapped[int | None] = mapped_column(Integer, nullable=True)
-    view_count: Mapped[int | None] = mapped_column(Integer, nullable=True)
-    like_count: Mapped[int | None] = mapped_column(Integer, nullable=True)
-    comment_count: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    # BIGINT: viral videos can exceed PostgreSQL INTEGER max (~2.1B views)
+    view_count: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    like_count: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    comment_count: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
     thumbnail_url: Mapped[str | None] = mapped_column(String(1000), nullable=True)
     tags_json: Mapped[str | None] = mapped_column(Text, nullable=True)
     youtube_category_id: Mapped[str | None] = mapped_column(String(32), nullable=True)
@@ -108,7 +110,7 @@ class Video(Base):
     local_path: Mapped[str | None] = mapped_column(String(1000), nullable=True)
     bunny_path: Mapped[str | None] = mapped_column(String(1000), nullable=True)
     bunny_url: Mapped[str | None] = mapped_column(String(1000), nullable=True)
-    file_size: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    file_size: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
     transfer_error: Mapped[str | None] = mapped_column(Text, nullable=True)
     uploaded_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
@@ -147,9 +149,9 @@ class Short(Base):
     published_at: Mapped[str | None] = mapped_column(String(64), nullable=True)
     duration_iso: Mapped[str | None] = mapped_column(String(32), nullable=True)
     duration_seconds: Mapped[int | None] = mapped_column(Integer, nullable=True)
-    view_count: Mapped[int | None] = mapped_column(Integer, nullable=True)
-    like_count: Mapped[int | None] = mapped_column(Integer, nullable=True)
-    comment_count: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    view_count: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    like_count: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    comment_count: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
     thumbnail_url: Mapped[str | None] = mapped_column(String(1000), nullable=True)
     tags_json: Mapped[str | None] = mapped_column(Text, nullable=True)
     youtube_category_id: Mapped[str | None] = mapped_column(String(32), nullable=True)
@@ -162,7 +164,7 @@ class Short(Base):
     local_path: Mapped[str | None] = mapped_column(String(1000), nullable=True)
     bunny_path: Mapped[str | None] = mapped_column(String(1000), nullable=True)
     bunny_url: Mapped[str | None] = mapped_column(String(1000), nullable=True)
-    file_size: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    file_size: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
     transfer_error: Mapped[str | None] = mapped_column(Text, nullable=True)
     uploaded_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
@@ -271,7 +273,7 @@ class PlaylistItem(Base):
     local_path: Mapped[str | None] = mapped_column(String(1000), nullable=True)
     bunny_path: Mapped[str | None] = mapped_column(String(1000), nullable=True)
     bunny_url: Mapped[str | None] = mapped_column(String(1000), nullable=True)
-    file_size: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    file_size: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
     transfer_error: Mapped[str | None] = mapped_column(Text, nullable=True)
     uploaded_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)

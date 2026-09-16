@@ -39,6 +39,7 @@ def make_engine(settings: Settings):
 def init_db(engine) -> None:
     Base.metadata.create_all(engine)
     _migrate_sqlite_playlist_item_columns(engine)
+    _migrate_count_columns_to_bigint(engine)
 
 
 def _migrate_sqlite_playlist_item_columns(engine) -> None:
@@ -61,6 +62,26 @@ def _migrate_sqlite_playlist_item_columns(engine) -> None:
             alters.append("ALTER TABLE playlist_items ADD COLUMN file_size INTEGER")
         if "uploaded_at" not in existing:
             alters.append("ALTER TABLE playlist_items ADD COLUMN uploaded_at DATETIME")
+        for sql in alters:
+            conn.exec_driver_sql(sql)
+
+
+def _migrate_count_columns_to_bigint(engine) -> None:
+    """Widen view/like/comment/file_size columns past PostgreSQL INTEGER max."""
+    if engine.dialect.name != "postgresql":
+        return
+    alters = [
+        "ALTER TABLE videos ALTER COLUMN view_count TYPE BIGINT",
+        "ALTER TABLE videos ALTER COLUMN like_count TYPE BIGINT",
+        "ALTER TABLE videos ALTER COLUMN comment_count TYPE BIGINT",
+        "ALTER TABLE videos ALTER COLUMN file_size TYPE BIGINT",
+        "ALTER TABLE shorts ALTER COLUMN view_count TYPE BIGINT",
+        "ALTER TABLE shorts ALTER COLUMN like_count TYPE BIGINT",
+        "ALTER TABLE shorts ALTER COLUMN comment_count TYPE BIGINT",
+        "ALTER TABLE shorts ALTER COLUMN file_size TYPE BIGINT",
+        "ALTER TABLE playlist_items ALTER COLUMN file_size TYPE BIGINT",
+    ]
+    with engine.begin() as conn:
         for sql in alters:
             conn.exec_driver_sql(sql)
 
