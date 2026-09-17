@@ -77,6 +77,20 @@ def run_transfer(session: Session, settings: Settings, **kwargs) -> None:
             "Run again later with: python main.py transfer --retry-failed "
             "(after YouTube rate-limit cools down)"
         )
+    # Fill any missing Storage thumbnails (videos/shorts/playlists/playlist-items).
+    # Skips rows that already have bunny_thumbnail_url.
+    t_up, t_fail, t_skip = transfer_thumbnails(
+        session,
+        settings,
+        channel_id=kwargs.get("channel_id"),
+        force=False,
+    )
+    log.info(
+        "Thumbnail backfill after transfer: %s uploaded, %s failed, %s already present",
+        t_up,
+        t_fail,
+        t_skip,
+    )
 
 
 def run_thumbnails(session: Session, settings: Settings, **kwargs) -> None:

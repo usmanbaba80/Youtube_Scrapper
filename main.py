@@ -73,7 +73,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--force",
         action="store_true",
-        help="Re-scrape channels / re-upload thumbnails even if already done",
+        help=(
+            "Re-scrape channels / re-upload thumbnails even if already on Bunny. "
+            "For thumbnails: only missing ones are uploaded unless --force is set"
+        ),
     )
     return parser
 

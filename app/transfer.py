@@ -21,7 +21,10 @@ from app.bunny import (
 )
 from app.config import Settings
 from app.models import Creator, PlaylistItem, Short, Video
-from app.thumbnails import try_upload_thumbnail_after_transfer
+from app.thumbnails import (
+    transfer_playlist_thumbnails,
+    try_upload_thumbnail_after_transfer,
+)
 from app.utils import creator_folder_name, utcnow
 
 log = logging.getLogger(__name__)
@@ -926,6 +929,8 @@ def transfer_videos(
         retry_failed=retry_failed,
         channel_id=channel_id,
     )
+    # Playlist covers are metadata-only (no Stream file) — upload Storage thumbs here.
+    transfer_playlist_thumbnails(session, settings, channel_id=channel_id, force=False)
     return uploaded + s_up + p_up, failed + s_fail + p_fail, 0
 
 

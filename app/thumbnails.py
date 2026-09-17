@@ -123,6 +123,86 @@ def sync_row_thumbnail(
     return True
 
 
+def transfer_playlist_thumbnails(
+    session: Session,
+    settings: Settings,
+    *,
+    channel_id: int | None = None,
+    force: bool = False,
+) -> tuple[int, int, int]:
+    """
+    Upload playlist cover art to Bunny Storage (``.../thumbnails/playlists/{id}.ext``).
+
+    Playlists are metadata-only (no Stream transfer), so this must run separately
+    from video/short/playlist-item post-transfer hooks.
+    Returns (uploaded, failed, skipped).
+    """
+    if not settings.bunny_storage_zone or not settings.bunny_storage_password:
+        log.warning("Bunny Storage not configured; skipping playlist thumbnails")
+        return 0, 0, 0
+
+    uploaded = 0
+    failed = 0
+    skipped = 0
+
+    pq = (
+        session.query(Playlist)
+        .options(joinedload(Playlist.creator))
+        .filter(Playlist.thumbnail_url.isnot(None), Playlist.thumbnail_url != "")
+    )
+    if not force:
+        pq = pq.filter(
+            (Playlist.bunny_thumbnail_url.is_(None)) | (Playlist.bunny_thumbnail_url == "")
+        )
+    if channel_id is not None:
+        pq = pq.filter(Playlist.creator_row_id == channel_id)
+
+    playlists = pq.order_by(Playlist.id.asc()).all()
+    if not playlists:
+        log.info("No playlist covers waiting for thumbnail upload")
+        return 0, 0, 0
+
+    log.info(
+        "Uploading thumbnails for %s playlist cover(s)%s",
+        len(playlists),
+        f" (channel_id={channel_id})" if channel_id is not None else "",
+    )
+    for playlist in playlists:
+        creator = playlist.creator
+        if creator is None:
+            failed += 1
+            continue
+        try:
+            if sync_row_thumbnail(
+                settings,
+                creator,
+                playlist,
+                kind="playlists",
+                public_id=playlist.playlist_id or playlist.youtube_playlist_id,
+                force=force,
+            ):
+                uploaded += 1
+            else:
+                skipped += 1
+            session.commit()
+        except Exception as exc:
+            session.rollback()
+            failed += 1
+            log.exception(
+                "Thumbnail failed for playlist %s: %s",
+                playlist.playlist_id or playlist.youtube_playlist_id,
+                exc,
+            )
+
+    log.info(
+        "Playlist covers: %s uploaded, %s failed, %s skipped",
+        uploaded,
+        failed,
+        skipped,
+    )
+    return uploaded, failed, skipped
+
+
 def transfer_thumbnails(
     session: Session,
     settings: Settings,
@@ -132,13 +212,18 @@ def transfer_thumbnails(
     force: bool = False,
 ) -> tuple[int, int, int]:
     """
-    Backfill Bunny Storage thumbnails for uploaded media (and playlists).
+    Backfill Bunny Storage thumbnails for uploaded media and playlist covers.
 
     Targets:
-      - videos/shorts/playlist_items with transfer_status=uploaded (or already have bunny_url)
-      - playlists with metadata fetched
+      - videos/shorts/playlist_items with transfer_status=uploaded
+      - playlists that have a YouTube thumbnail_url (cover art)
     Skips rows that already have bunny_thumbnail_url unless force=True.
+    Use this to complete a partial set (some present, some missing).
     """
+    if not settings.bunny_storage_zone or not settings.bunny_storage_password:
+        log.warning("Bunny Storage not configured; skipping thumbnails")
+        return 0, 0, 0
+
     uploaded = 0
     failed = 0
     skipped = 0
@@ -211,36 +296,16 @@ def transfer_thumbnails(
             failed += 1
             log.exception("Thumbnail failed for short %s: %s", short.youtube_video_id, exc)
 
-    # Playlists (cover art)
-    pq = (
-        session.query(Playlist)
-        .options(joinedload(Playlist.creator))
-        .filter(Playlist.metadata_status.in_(["fetched", "done"]))
-        .filter(Playlist.thumbnail_url.isnot(None), Playlist.thumbnail_url != "")
+    # Playlist covers (no Stream upload — Storage only)
+    p_up, p_fail, p_skip = transfer_playlist_thumbnails(
+        session,
+        settings,
+        channel_id=channel_id,
+        force=force,
     )
-    if not force:
-        pq = pq.filter(
-            (Playlist.bunny_thumbnail_url.is_(None)) | (Playlist.bunny_thumbnail_url == "")
-        )
-    pq = _creator_filter(pq.join(Playlist.creator))
-    for playlist in pq.order_by(Playlist.id.asc()).all():
-        try:
-            if sync_row_thumbnail(
-                settings,
-                playlist.creator,
-                playlist,
-                kind="playlists",
-                public_id=playlist.playlist_id or playlist.youtube_playlist_id,
-                force=force,
-            ):
-                uploaded += 1
-            else:
-                skipped += 1
-            session.commit()
-        except Exception as exc:
-            session.rollback()
-            failed += 1
-            log.exception("Thumbnail failed for playlist %s: %s", playlist.playlist_id, exc)
+    uploaded += p_up
+    failed += p_fail
+    skipped += p_skip
 
     # Standalone playlist items (not reused from videos/shorts)
     iq = (
