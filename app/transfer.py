@@ -53,6 +53,11 @@ def creator_display_name(creator: Creator) -> str:
     ).strip() or f"creator-{creator.id}"
 
 
+def stream_creator_key(creator: Creator) -> str:
+    """Bunny Stream folder key: creator display name (e.g. Peppa Pig/videos)."""
+    return creator_display_name(creator)
+
+
 def _resolve_js_runtimes(settings: Settings) -> dict[str, dict]:
     """YouTube extraction now requires a JS runtime (Deno preferred)."""
     configured = (settings.ytdlp_js_runtimes or "").strip()
@@ -470,19 +475,20 @@ def upload_videos(
     for creator_index, (_cid, creator_videos) in enumerate(by_creator.items(), start=1):
         creator = creator_videos[0].creator
         folder = creator_dir(settings, creator, FOLDER_VIDEOS)
-        collection_title = creator_display_name(creator)
+        stream_key = stream_creator_key(creator)
+        label = creator_display_name(creator)
         log.info(
             "[creator %s/%s] Uploading %s videos for creator %r -> %s/videos",
             creator_index,
             len(by_creator),
             len(creator_videos),
-            collection_title,
-            collection_title,
+            label,
+            stream_key,
         )
 
         try:
             collection_id = bunny.ensure_folder_collection(
-                collection_title,
+                stream_key,
                 FOLDER_VIDEOS,
                 preferred_id=creator.bunny_collection_id,
             )
@@ -490,7 +496,7 @@ def upload_videos(
                 creator.bunny_collection_id = collection_id
                 session.commit()
         except Exception as exc:
-            log.exception("Failed to ensure Stream collection for %s/videos", collection_title)
+            log.exception("Failed to ensure Stream collection for %s/videos", stream_key)
             for video in creator_videos:
                 video.transfer_status = "failed"
                 video.transfer_error = f"Collection error: {exc}"[:2000]
@@ -518,9 +524,10 @@ def upload_videos(
 
         workers = min(settings.upload_concurrency, len(jobs))
         log.info(
-            "Uploading %s files for %r with concurrency=%s",
+            "Uploading %s files for %r (%s/videos) with concurrency=%s",
             len(jobs),
-            collection_title,
+            label,
+            stream_key,
             workers,
         )
 
@@ -748,162 +755,164 @@ def transfer_videos(
         max_per_channel=settings.max_videos_per_channel,
     )
     session.commit()
-    if not videos:
-        log.info("No videos waiting to transfer")
-        return 0, 0, 0
-
-    bunny = BunnyStream(settings)
-    settings.download_dir.mkdir(parents=True, exist_ok=True)
-
-    # Ensure CreatorName/videos collections up front.
-    collection_by_creator: dict[int, str] = {}
-    by_creator: dict[int, list[Video]] = defaultdict(list)
-    for video in videos:
-        by_creator[video.creator_row_id].append(video)
-
-    skipped_creators: set[int] = set()
-    for creator_row_id, creator_videos in by_creator.items():
-        creator = creator_videos[0].creator
-        title = creator_display_name(creator)
-        try:
-            # Prefetch all three folders so Stream UI shows the tree.
-            folders = bunny.ensure_creator_folders(title)
-            collection_id = folders[FOLDER_VIDEOS]
-            if creator.bunny_collection_id != collection_id:
-                creator.bunny_collection_id = collection_id
-            collection_by_creator[creator_row_id] = collection_id
-        except Exception as exc:
-            log.exception("Failed Stream collection for %s", title)
-            skipped_creators.add(creator_row_id)
-            for video in creator_videos:
-                video.transfer_status = "failed"
-                video.transfer_error = f"Collection error: {exc}"[:2000]
-
-    session.commit()
-    videos = [v for v in videos if v.creator_row_id not in skipped_creators]
-    if not videos:
-        return 0, len(skipped_creators), 0
-
-    jobs: list[_TransferJob] = []
-    for video in videos:
-        collection_id = collection_by_creator.get(video.creator_row_id)
-        if not collection_id:
-            continue
-        creator = video.creator
-        folder = creator_dir(settings, creator, FOLDER_VIDEOS)
-        existing = Path(video.local_path) if video.local_path else None
-        if existing and not existing.exists():
-            existing = None
-        video.transfer_status = "downloading" if existing is None else "uploading"
-        video.transfer_error = None
-        jobs.append(
-            _TransferJob(
-                db_id=video.id,
-                youtube_video_id=video.youtube_video_id,
-                url=video.url,
-                title=video.title,
-                app_video_id=video.video_id,
-                collection_id=collection_id,
-                output_dir=folder,
-                existing_local=existing,
-            )
-        )
-    session.commit()
-
-    if not jobs:
-        log.info("No transfer jobs after collection setup")
-        return 0, 0, 0
-
-    workers = min(settings.transfer_concurrency, len(jobs))
-    log.info(
-        "Transferring %s videos with concurrency=%s (download → upload → delete)",
-        len(jobs),
-        workers,
-    )
 
     uploaded = 0
     failed = 0
-    video_by_id = {v.id: v for v in videos}
 
-    with ThreadPoolExecutor(max_workers=workers) as pool:
-        futures = {
-            pool.submit(_run_transfer_job, settings, job): job for job in jobs
-        }
-        for future in as_completed(futures):
-            job = futures[future]
+    if not videos:
+        log.info("No videos waiting to transfer")
+    else:
+        bunny = BunnyStream(settings)
+        settings.download_dir.mkdir(parents=True, exist_ok=True)
+
+        # Ensure {CreatorName}/videos|shorts|playlists collections up front.
+        collection_by_creator: dict[int, str] = {}
+        by_creator: dict[int, list[Video]] = defaultdict(list)
+        for video in videos:
+            by_creator[video.creator_row_id].append(video)
+
+        skipped_creators: set[int] = set()
+        for creator_row_id, creator_videos in by_creator.items():
+            creator = creator_videos[0].creator
+            stream_key = stream_creator_key(creator)
             try:
-                result = future.result()
+                # Prefetch all three folders so Stream UI shows the tree.
+                folders = bunny.ensure_creator_folders(stream_key)
+                collection_id = folders[FOLDER_VIDEOS]
+                if creator.bunny_collection_id != collection_id:
+                    creator.bunny_collection_id = collection_id
+                collection_by_creator[creator_row_id] = collection_id
             except Exception as exc:
-                failed += 1
-                video = session.get(Video, job.db_id) or video_by_id.get(job.db_id)
-                if video is not None:
+                log.exception("Failed Stream collection for %s", stream_key)
+                skipped_creators.add(creator_row_id)
+                for video in creator_videos:
                     video.transfer_status = "failed"
-                    video.transfer_error = f"Worker crashed: {exc}"[:2000]
+                    video.transfer_error = f"Collection error: {exc}"[:2000]
+
+        session.commit()
+        videos = [v for v in videos if v.creator_row_id not in skipped_creators]
+        failed += len(skipped_creators)
+
+        jobs: list[_TransferJob] = []
+        for video in videos:
+            collection_id = collection_by_creator.get(video.creator_row_id)
+            if not collection_id:
+                continue
+            creator = video.creator
+            folder = creator_dir(settings, creator, FOLDER_VIDEOS)
+            existing = Path(video.local_path) if video.local_path else None
+            if existing and not existing.exists():
+                existing = None
+            video.transfer_status = "downloading" if existing is None else "uploading"
+            video.transfer_error = None
+            jobs.append(
+                _TransferJob(
+                    db_id=video.id,
+                    youtube_video_id=video.youtube_video_id,
+                    url=video.url,
+                    title=video.title,
+                    app_video_id=video.video_id,
+                    collection_id=collection_id,
+                    output_dir=folder,
+                    existing_local=existing,
+                )
+            )
+        session.commit()
+
+        if not jobs:
+            log.info("No video transfer jobs after collection setup")
+        else:
+            workers = min(settings.transfer_concurrency, len(jobs))
+            log.info(
+                "Transferring %s videos with concurrency=%s (download → upload → delete)",
+                len(jobs),
+                workers,
+            )
+
+            video_by_id = {v.id: v for v in videos}
+
+            with ThreadPoolExecutor(max_workers=workers) as pool:
+                futures = {
+                    pool.submit(_run_transfer_job, settings, job): job for job in jobs
+                }
+                for future in as_completed(futures):
+                    job = futures[future]
                     try:
+                        result = future.result()
+                    except Exception as exc:
+                        failed += 1
+                        video = session.get(Video, job.db_id) or video_by_id.get(job.db_id)
+                        if video is not None:
+                            video.transfer_status = "failed"
+                            video.transfer_error = f"Worker crashed: {exc}"[:2000]
+                            try:
+                                session.commit()
+                            except Exception:
+                                session.rollback()
+                                log.exception(
+                                    "DB commit failed after worker crash for %s",
+                                    job.youtube_video_id,
+                                )
+                        log.exception("Transfer worker crashed for %s", job.youtube_video_id)
+                        continue
+
+                    video = session.get(Video, job.db_id) or video_by_id.get(job.db_id)
+                    if video is None:
+                        log.error("No DB row for transfer job %s", job.youtube_video_id)
+                        continue
+                    try:
+                        if result["ok"]:
+                            bunny_info = result["bunny"]
+                            video.file_size = result.get("file_size")
+                            video.bunny_path = bunny_info["video_id"]
+                            video.bunny_url = bunny_info.get("hls_url") or bunny_info["play_url"]
+                            video.transfer_status = "uploaded"
+                            video.uploaded_at = utcnow()
+                            video.local_path = None
+                            video.transfer_error = None
+                            try_upload_thumbnail_after_transfer(
+                                settings,
+                                session,
+                                creator=video.creator,
+                                row=video,
+                                kind="videos",
+                                public_id=video.video_id or video.youtube_video_id,
+                            )
+                            uploaded += 1
+                            log.info(
+                                "Transferred %s -> Stream %s (collection %s)",
+                                result["youtube_video_id"],
+                                bunny_info["video_id"],
+                                job.collection_id,
+                            )
+                        else:
+                            video.transfer_status = "failed"
+                            video.transfer_error = result.get("error")
+                            video.local_path = result.get("local_path")
+                            failed += 1
+                            log.error(
+                                "Transfer failed for %s: %s",
+                                result["youtube_video_id"],
+                                result.get("error"),
+                            )
                         session.commit()
                     except Exception:
                         session.rollback()
-                        log.exception("DB commit failed after worker crash for %s", job.youtube_video_id)
-                log.exception("Transfer worker crashed for %s", job.youtube_video_id)
-                continue
+                        failed += 1
+                        log.exception(
+                            "Failed to persist transfer result for %s (Bunny may already have the file)",
+                            job.youtube_video_id,
+                        )
 
-            video = session.get(Video, job.db_id) or video_by_id.get(job.db_id)
-            if video is None:
-                log.error("No DB row for transfer job %s", job.youtube_video_id)
-                continue
-            try:
-                if result["ok"]:
-                    bunny_info = result["bunny"]
-                    video.file_size = result.get("file_size")
-                    video.bunny_path = bunny_info["video_id"]
-                    video.bunny_url = bunny_info.get("hls_url") or bunny_info["play_url"]
-                    video.transfer_status = "uploaded"
-                    video.uploaded_at = utcnow()
-                    video.local_path = None
-                    video.transfer_error = None
-                    try_upload_thumbnail_after_transfer(
-                        settings,
-                        session,
-                        creator=video.creator,
-                        row=video,
-                        kind="videos",
-                        public_id=video.video_id or video.youtube_video_id,
-                    )
-                    uploaded += 1
-                    log.info(
-                        "Transferred %s -> Stream %s (collection %s)",
-                        result["youtube_video_id"],
-                        bunny_info["video_id"],
-                        job.collection_id,
-                    )
-                else:
-                    video.transfer_status = "failed"
-                    video.transfer_error = result.get("error")
-                    video.local_path = result.get("local_path")
-                    failed += 1
-                    log.error(
-                        "Transfer failed for %s: %s",
-                        result["youtube_video_id"],
-                        result.get("error"),
-                    )
-                session.commit()
-            except Exception:
-                session.rollback()
-                failed += 1
-                log.exception(
-                    "Failed to persist transfer result for %s (Bunny may already have the file)",
-                    job.youtube_video_id,
-                )
-
-    # Clean empty local folders under each creator.
-    for creator_videos in by_creator.values():
-        for kind in (FOLDER_VIDEOS, FOLDER_SHORTS, FOLDER_PLAYLISTS):
-            folder = creator_dir(settings, creator_videos[0].creator, kind)
-            if folder.exists() and not any(folder.iterdir()):
-                shutil.rmtree(folder, ignore_errors=True)
-        root = settings.download_dir / creator_folder_name(creator_videos[0].creator)
-        if root.exists() and not any(root.iterdir()):
-            shutil.rmtree(root, ignore_errors=True)
+            # Clean empty local folders under each creator.
+            for creator_videos in by_creator.values():
+                for kind in (FOLDER_VIDEOS, FOLDER_SHORTS, FOLDER_PLAYLISTS):
+                    folder = creator_dir(settings, creator_videos[0].creator, kind)
+                    if folder.exists() and not any(folder.iterdir()):
+                        shutil.rmtree(folder, ignore_errors=True)
+                root = settings.download_dir / creator_folder_name(creator_videos[0].creator)
+                if root.exists() and not any(root.iterdir()):
+                    shutil.rmtree(root, ignore_errors=True)
 
     s_up, s_fail = transfer_shorts(
         session,
@@ -947,11 +956,11 @@ def transfer_shorts(
     skipped: set[int] = set()
     for cid, rows in by_creator.items():
         creator = rows[0].creator
-        title = creator_display_name(creator)
+        stream_key = stream_creator_key(creator)
         try:
-            collections[cid] = bunny.ensure_folder_collection(title, FOLDER_SHORTS)
+            collections[cid] = bunny.ensure_folder_collection(stream_key, FOLDER_SHORTS)
         except Exception as exc:
-            log.exception("Failed Stream collection for %s/shorts", title)
+            log.exception("Failed Stream collection for %s/shorts", stream_key)
             skipped.add(cid)
             for short in rows:
                 short.transfer_status = "failed"
@@ -1148,11 +1157,11 @@ def transfer_playlist_items(
         if creator is None:
             skipped.add(cid)
             continue
-        title = creator_display_name(creator)
+        stream_key = stream_creator_key(creator)
         try:
-            collections[cid] = bunny.ensure_folder_collection(title, FOLDER_PLAYLISTS)
+            collections[cid] = bunny.ensure_folder_collection(stream_key, FOLDER_PLAYLISTS)
         except Exception as exc:
-            log.exception("Failed Stream collection for %s/playlists", title)
+            log.exception("Failed Stream collection for %s/playlists", stream_key)
             skipped.add(cid)
             for item in items:
                 if item.creator_row_id == cid:

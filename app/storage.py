@@ -4,6 +4,8 @@ import logging
 import mimetypes
 from pathlib import Path
 
+from urllib.parse import quote
+
 import requests
 
 from app.config import Settings
@@ -11,16 +13,23 @@ from app.config import Settings
 log = logging.getLogger(__name__)
 
 
+def _encode_storage_path(path: str) -> str:
+    """Encode each path segment so spaces/special chars are valid in the URL."""
+    return "/".join(quote(part, safe="") for part in path.strip("/").split("/"))
+
+
 class BunnyStorage:
     """
     Upload files into a Bunny.net Storage Zone.
 
-    Path layout under BUNNY_ROOT_PATH (default Kids Apps/VoD - Roku TV):
+    Path layout for thumbnails only (BUNNY_ROOT_PATH + creator_id):
 
       {root}/{CreatorName}/thumbnails/videos/{id}.jpg
       {root}/{CreatorName}/thumbnails/shorts/{id}.jpg
       {root}/{CreatorName}/thumbnails/playlists/{id}.jpg
       {root}/{CreatorName}/thumbnails/playlist-items/{youtube_video_id}.jpg
+
+    Stream video uploads use a different layout: {CreatorName}/videos|shorts|playlists
     """
 
     def __init__(self, settings: Settings) -> None:
@@ -43,7 +52,7 @@ class BunnyStorage:
 
     def upload_bytes(self, remote_path: str, data: bytes, content_type: str) -> dict[str, str]:
         path = remote_path.lstrip("/")
-        url = f"{self.base}/{path}"
+        url = f"{self.base}/{_encode_storage_path(path)}"
         response = self.session.put(
             url,
             data=data,
@@ -68,9 +77,9 @@ class BunnyStorage:
 
     def cdn_url(self, remote_path: str) -> str:
         path = remote_path.lstrip("/")
+        encoded = _encode_storage_path(path)
         cdn = (self.settings.bunny_storage_cdn_hostname or "").strip().rstrip("/")
         if not cdn:
-            # Fallback to storage URL (may require auth; set CDN hostname in .env)
-            return f"{self.base}/{path}"
+            return f"{self.base}/{encoded}"
         cdn = cdn.removeprefix("https://").removeprefix("http://")
-        return f"https://{cdn}/{path}"
+        return f"https://{cdn}/{encoded}"

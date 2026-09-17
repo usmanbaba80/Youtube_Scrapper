@@ -76,13 +76,14 @@ class _ProgressReader:
 
 class BunnyStream:
     """
-    Upload into Bunny Stream using creator folder collections under BUNNY_ROOT_PATH:
+    Upload into Bunny Stream using creator-name folder collections:
 
-        Kids Apps/VoD - Roku TV/{CreatorName}/videos
-        Kids Apps/VoD - Roku TV/{CreatorName}/shorts
-        Kids Apps/VoD - Roku TV/{CreatorName}/playlists
+        {CreatorName}/videos
+        {CreatorName}/shorts
+        {CreatorName}/playlists
 
     Stream has no nested collections API, so the slash is part of the name.
+    Thumbnail Storage uses BUNNY_ROOT_PATH separately (see BunnyStorage / thumbnails).
     """
 
     def __init__(self, settings: Settings) -> None:
@@ -104,26 +105,20 @@ class BunnyStream:
     def _url(self, path: str) -> str:
         return f"{STREAM_API}/library/{self.library_id}/{path.lstrip('/')}"
 
-    def creator_base_path(self, creator_name: str) -> str:
-        """Kids Apps/VoD - Roku TV/{CreatorName} (or just CreatorName if root empty)."""
-        creator = (creator_name or "Unknown Creator").strip() or "Unknown Creator"
-        root = (self.settings.bunny_root_path or "").strip().strip("/")
-        if root:
-            return f"{root}/{creator}"
-        return creator
-
-    def collection_name(self, creator_name: str, folder: str) -> str:
+    @staticmethod
+    def collection_name(creator_key: str, folder: str) -> str:
         """
-        Stream collection name (flat API; slash encodes folders):
+        Stream collection name for video media only:
 
-          Kids Apps/VoD - Roku TV/{Creator}/videos
-          Kids Apps/VoD - Roku TV/{Creator}/shorts
-          Kids Apps/VoD - Roku TV/{Creator}/playlists
+          {CreatorName}/videos
+          {CreatorName}/shorts
+          {CreatorName}/playlists
         """
+        key = str(creator_key or "").strip() or "unknown"
         folder = (folder or FOLDER_VIDEOS).strip().strip("/")
         if folder not in CREATOR_FOLDERS:
             raise ValueError(f"Unknown folder {folder!r}; expected one of {CREATOR_FOLDERS}")
-        return f"{self.creator_base_path(creator_name)}/{folder}"
+        return f"{key}/{folder}"
 
     def collection_exists(self, collection_id: str) -> bool:
         if not collection_id:
@@ -148,13 +143,13 @@ class BunnyStream:
 
     def ensure_folder_collection(
         self,
-        creator_name: str,
+        creator_key: str,
         folder: str,
         *,
         preferred_id: str | None = None,
     ) -> str:
-        """Return collection GUID for {root}/{Creator}/{folder}, creating if needed."""
-        name = self.collection_name(creator_name, folder)
+        """Return collection GUID for {creator_id}/{folder}, creating if needed."""
+        name = self.collection_name(creator_key, folder)
         cache_key = name.casefold()
         cached = self._collection_cache.get(cache_key)
         if cached:
@@ -204,23 +199,23 @@ class BunnyStream:
         log.info("Created Stream collection %r (%s)", name, collection_id)
         return collection_id
 
-    def ensure_creator_folders(self, creator_name: str) -> dict[str, str]:
-        """Create/find videos, shorts, and playlists collections for a creator."""
+    def ensure_creator_folders(self, creator_key: str) -> dict[str, str]:
+        """Create/find videos, shorts, and playlists collections for a creator_id."""
         return {
-            folder: self.ensure_folder_collection(creator_name, folder)
+            folder: self.ensure_folder_collection(creator_key, folder)
             for folder in CREATOR_FOLDERS
         }
 
     # Backward-compatible alias: old code meant the creator's main (videos) folder.
     def ensure_creator_collection(
         self,
-        creator_name: str,
+        creator_key: str,
         *,
         preferred_id: str | None = None,
         folder: str = FOLDER_VIDEOS,
     ) -> str:
         return self.ensure_folder_collection(
-            creator_name, folder, preferred_id=preferred_id
+            creator_key, folder, preferred_id=preferred_id
         )
 
     def _find_collection_by_name(self, name: str) -> str | None:

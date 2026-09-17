@@ -10,7 +10,6 @@ from sqlalchemy.orm import Session, joinedload
 from app.config import Settings
 from app.models import Creator, Playlist, PlaylistItem, Short, Video
 from app.storage import BunnyStorage
-from app.utils import creator_folder_name
 
 log = logging.getLogger(__name__)
 
@@ -53,9 +52,15 @@ def _download_thumbnail(url: str) -> tuple[bytes, str]:
 
 def _storage_path(settings: Settings, creator: Creator, kind: str, public_id: str, ext: str) -> str:
     """
-    Kids Apps/VoD - Roku TV/{Creator}/thumbnails/{videos|shorts|playlists|playlist-items}/{id}.ext
+    Thumbnails only (Bunny Storage):
+
+      Kids Apps/VoD - Roku TV/{CreatorName}/thumbnails/{videos|shorts|playlists|playlist-items}/{id}.ext
     """
-    creator_part = creator_folder_name(creator)
+    # Same display name as Stream folders (e.g. "Peppa Pig").
+    creator_part = (
+        (creator.name or creator.handle or f"creator-{creator.id}").strip().lstrip("@").strip()
+        or f"creator-{creator.id}"
+    )
     root = (settings.bunny_root_path or "").strip().strip("/")
     base = f"{root}/{creator_part}" if root else creator_part
     safe_id = re.sub(r"[^\w.\-]+", "_", public_id)[:120] or "item"
