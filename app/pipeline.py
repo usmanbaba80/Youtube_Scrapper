@@ -11,6 +11,7 @@ from app.export_json import export_jsons
 from app.metadata import fetch_all_metadata
 from app.models import Category, Creator, Playlist, PlaylistItem, Short, Video
 from app.scraper import scrape_all_creators
+from app.thumbnails import transfer_thumbnails
 from app.transfer import download_videos, transfer_videos, upload_videos
 
 log = logging.getLogger(__name__)
@@ -78,6 +79,16 @@ def run_transfer(session: Session, settings: Settings, **kwargs) -> None:
         )
 
 
+def run_thumbnails(session: Session, settings: Settings, **kwargs) -> None:
+    uploaded, failed, skipped = transfer_thumbnails(session, settings, **kwargs)
+    log.info(
+        "Thumbnails finished: %s uploaded to Bunny Storage, %s failed, %s skipped",
+        uploaded,
+        failed,
+        skipped,
+    )
+
+
 def run_all(
     factory: sessionmaker,
     settings: Settings,
@@ -104,6 +115,13 @@ def run_all(
             settings,
             retry_failed=retry_failed,
             channel_id=channel_id,
+        )
+        session.commit()
+        run_thumbnails(
+            session,
+            settings,
+            channel_id=channel_id,
+            force=False,
         )
 
 
@@ -137,6 +155,12 @@ def print_status(session: Session) -> None:
         "  metadata fetched:",
         session.query(func.count(Video.id)).filter(Video.metadata_status == "fetched").scalar(),
     )
+    print(
+        "  bunny thumbnails:",
+        session.query(func.count(Video.id))
+        .filter(Video.bunny_thumbnail_url.isnot(None), Video.bunny_thumbnail_url != "")
+        .scalar(),
+    )
 
     shorts = session.query(func.count(Short.id)).scalar() or 0
     print(f"Shorts:     {shorts}")
@@ -149,6 +173,12 @@ def print_status(session: Session) -> None:
     print(
         "  metadata fetched:",
         session.query(func.count(Short.id)).filter(Short.metadata_status == "fetched").scalar(),
+    )
+    print(
+        "  bunny thumbnails:",
+        session.query(func.count(Short.id))
+        .filter(Short.bunny_thumbnail_url.isnot(None), Short.bunny_thumbnail_url != "")
+        .scalar(),
     )
 
     playlists = session.query(func.count(Playlist.id)).scalar() or 0

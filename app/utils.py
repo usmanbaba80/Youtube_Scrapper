@@ -34,6 +34,16 @@ def slugify(value: str, fallback: str = "item") -> str:
     return text[:80] or fallback
 
 
+def creator_folder_name(creator) -> str:
+    """Filesystem/Bunny-safe folder name for a creator row."""
+    raw = (getattr(creator, "handle", None) or getattr(creator, "name", None) or f"creator-{getattr(creator, 'id', 'x')}")
+    raw = str(raw).lstrip("@").strip()
+    cleaned = re.sub(r'[<>:"/\\|?*\x00-\x1f]', "", raw)
+    cleaned = re.sub(r"\s+", "-", cleaned).strip(" .-_")
+    cid = getattr(creator, "id", "x")
+    return cleaned[:120] or f"creator-{cid}"
+
+
 def parse_sheet_category_id(sheet_title: str) -> int | None:
     """Extract category id from sheet title brackets, e.g. 'Kids - MiniMinds (1)' -> 1."""
     match = re.search(r"\((\d+)\)\s*$", (sheet_title or "").strip())

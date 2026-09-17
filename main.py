@@ -15,6 +15,7 @@ from app.pipeline import (
     run_load_excel,
     run_metadata,
     run_scrape,
+    run_thumbnails,
     run_transfer,
     run_upload,
 )
@@ -46,6 +47,7 @@ def build_parser() -> argparse.ArgumentParser:
             "download",
             "upload",
             "transfer",
+            "thumbnails",
             "export-json",
             "run",
             "status",
@@ -71,7 +73,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--force",
         action="store_true",
-        help="Re-scrape channels even if already marked done",
+        help="Re-scrape channels / re-upload thumbnails even if already done",
     )
     return parser
 
@@ -131,6 +133,14 @@ def main() -> None:
                 settings,
                 retry_failed=args.retry_failed,
                 channel_id=args.channel_id,
+            )
+        elif args.command == "thumbnails":
+            run_thumbnails(
+                session,
+                settings,
+                channel_id=args.channel_id,
+                retry_failed=args.retry_failed,
+                force=args.force,
             )
         elif args.command == "export-json":
             out = args.output_dir

@@ -53,6 +53,10 @@ class Settings:
     bunny_stream_library_id: str
     bunny_stream_api_key: str
     bunny_stream_cdn_hostname: str
+    bunny_storage_zone: str
+    bunny_storage_password: str
+    bunny_storage_hostname: str
+    bunny_storage_cdn_hostname: str
     upload_concurrency: int
     transfer_concurrency: int
     database_url: str
@@ -93,6 +97,10 @@ def load_settings() -> Settings:
         bunny_stream_library_id=_env("BUNNY_STREAM_LIBRARY_ID"),
         bunny_stream_api_key=_env("BUNNY_STREAM_API_KEY"),
         bunny_stream_cdn_hostname=_env("BUNNY_STREAM_CDN_HOSTNAME"),
+        bunny_storage_zone=_env("BUNNY_STORAGE_ZONE"),
+        bunny_storage_password=_env("BUNNY_STORAGE_PASSWORD"),
+        bunny_storage_hostname=_env("BUNNY_STORAGE_HOSTNAME", "storage.bunnycdn.com"),
+        bunny_storage_cdn_hostname=_env("BUNNY_STORAGE_CDN_HOSTNAME"),
         upload_concurrency=max(1, _env_int("UPLOAD_CONCURRENCY", 3)),
         # How many videos may be mid download+upload at once (limits disk use).
         transfer_concurrency=max(1, _env_int("TRANSFER_CONCURRENCY", 2)),

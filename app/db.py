@@ -40,6 +40,39 @@ def init_db(engine) -> None:
     Base.metadata.create_all(engine)
     _migrate_sqlite_playlist_item_columns(engine)
     _migrate_count_columns_to_bigint(engine)
+    _migrate_bunny_thumbnail_columns(engine)
+
+
+def _table_columns(conn, dialect: str, table: str) -> set[str]:
+    if dialect == "sqlite":
+        rows = conn.exec_driver_sql(f"PRAGMA table_info({table})").fetchall()
+        return {row[1] for row in rows}
+    rows = conn.exec_driver_sql(
+        "SELECT column_name FROM information_schema.columns "
+        f"WHERE table_schema = 'public' AND table_name = '{table}'"
+    ).fetchall()
+    return {row[0] for row in rows}
+
+
+def _migrate_bunny_thumbnail_columns(engine) -> None:
+    """Add bunny_thumbnail_* columns for videos/shorts/playlists/playlist_items."""
+    dialect = engine.dialect.name
+    if dialect not in {"sqlite", "postgresql"}:
+        return
+    targets = ("videos", "shorts", "playlists", "playlist_items")
+    with engine.begin() as conn:
+        for table in targets:
+            existing = _table_columns(conn, dialect, table)
+            if not existing:
+                continue
+            if "bunny_thumbnail_path" not in existing:
+                conn.exec_driver_sql(
+                    f"ALTER TABLE {table} ADD COLUMN bunny_thumbnail_path VARCHAR(1000)"
+                )
+            if "bunny_thumbnail_url" not in existing:
+                conn.exec_driver_sql(
+                    f"ALTER TABLE {table} ADD COLUMN bunny_thumbnail_url VARCHAR(1000)"
+                )
 
 
 def _migrate_sqlite_playlist_item_columns(engine) -> None:

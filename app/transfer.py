@@ -21,7 +21,8 @@ from app.bunny import (
 )
 from app.config import Settings
 from app.models import Creator, PlaylistItem, Short, Video
-from app.utils import utcnow
+from app.thumbnails import try_upload_thumbnail_after_transfer
+from app.utils import creator_folder_name, utcnow
 
 log = logging.getLogger(__name__)
 
@@ -39,13 +40,6 @@ def _upload_one_file(
         title=title,
         collection_id=collection_id,
     )
-
-
-def creator_folder_name(creator: Creator) -> str:
-    raw = (creator.handle or creator.name or f"creator-{creator.id}").lstrip("@").strip()
-    cleaned = re.sub(r'[<>:"/\\|?*\x00-\x1f]', "", raw)
-    cleaned = re.sub(r"\s+", "-", cleaned).strip(" .-_")
-    return cleaned[:120] or f"creator-{creator.id}"
 
 
 def creator_dir(settings: Settings, creator: Creator, folder: str = FOLDER_VIDEOS) -> Path:
@@ -109,6 +103,19 @@ def _resolve_ffmpeg_location(settings: Settings) -> str | None:
     return None
 
 
+def _reject_live_or_premiere(info: dict, *, incomplete: bool = False) -> str | None:
+    """Block live/upcoming streams so yt-dlp does not hang on endless HLS."""
+    if info.get("is_live") is True:
+        return "skipping live stream (not a finished VOD)"
+    status = str(info.get("live_status") or "").lower()
+    if status in {"is_live", "is_upcoming"}:
+        return f"skipping {status} content"
+    # Live HLS manifests (as in user logs: source/yt_live_broadcast)
+    if str(info.get("live_status") or "").lower() == "post_live" and not info.get("duration"):
+        return "skipping post-live stream without fixed duration"
+    return None
+
+
 def _ytdlp_download_opts(settings: Settings, output_dir: Path) -> dict:
     js_runtimes = _resolve_js_runtimes(settings)
     ffmpeg_location = _resolve_ffmpeg_location(settings)
@@ -162,6 +169,9 @@ def _ytdlp_download_opts(settings: Settings, output_dir: Path) -> dict:
         "no_warnings": False,
         "restrictfilenames": True,
         "remote_components": ["ejs:github"],
+        # Never follow endless live HLS.
+        "match_filter": _reject_live_or_premiere,
+        "wait_for_video": None,
         "extractor_args": {
             "youtube": {
                 # Clients must match cookie mode: with cookies, android_vr/tv_simply
@@ -207,6 +217,14 @@ def download_video(settings: Settings, video: Video, output_dir: Path) -> Path:
     for attempt in range(1, attempts + 1):
         try:
             with YoutubeDL(opts) as ydl:
+                # Probe first so live streams fail fast (before ffmpeg HLS loop).
+                meta = ydl.extract_info(video.url, download=False)
+                if not meta:
+                    raise RuntimeError("yt-dlp returned no metadata")
+                reject = _reject_live_or_premiere(meta)
+                if reject:
+                    raise RuntimeError(reject)
+
                 info = ydl.extract_info(video.url, download=True)
                 if not info:
                     raise RuntimeError("yt-dlp returned no info after download")
@@ -529,6 +547,14 @@ def upload_videos(
                     video.uploaded_at = utcnow()
                     video.local_path = None
                     video.transfer_error = None
+                    try_upload_thumbnail_after_transfer(
+                        settings,
+                        session,
+                        creator=video.creator,
+                        row=video,
+                        kind="videos",
+                        public_id=video.video_id or video.youtube_video_id,
+                    )
                     session.commit()
                     local_path.unlink(missing_ok=True)
                     uploaded += 1
@@ -835,6 +861,14 @@ def transfer_videos(
                     video.uploaded_at = utcnow()
                     video.local_path = None
                     video.transfer_error = None
+                    try_upload_thumbnail_after_transfer(
+                        settings,
+                        session,
+                        creator=video.creator,
+                        row=video,
+                        kind="videos",
+                        public_id=video.video_id or video.youtube_video_id,
+                    )
                     uploaded += 1
                     log.info(
                         "Transferred %s -> Stream %s (collection %s)",
@@ -980,6 +1014,14 @@ def transfer_shorts(
                     short.uploaded_at = utcnow()
                     short.local_path = None
                     short.transfer_error = None
+                    try_upload_thumbnail_after_transfer(
+                        settings,
+                        session,
+                        creator=short.creator,
+                        row=short,
+                        kind="shorts",
+                        public_id=short.short_id or short.youtube_video_id,
+                    )
                     uploaded += 1
                     log.info(
                         "Transferred short %s -> Stream %s",
@@ -1175,6 +1217,16 @@ def transfer_playlist_items(
                     item.uploaded_at = utcnow()
                     item.local_path = None
                     item.transfer_error = None
+                    creator = session.get(Creator, item.creator_row_id)
+                    if creator is not None:
+                        try_upload_thumbnail_after_transfer(
+                            settings,
+                            session,
+                            creator=creator,
+                            row=item,
+                            kind="playlist-items",
+                            public_id=item.youtube_video_id,
+                        )
                     uploaded += 1
                 else:
                     item.transfer_status = "failed"

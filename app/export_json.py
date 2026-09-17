@@ -48,6 +48,8 @@ def _video_payload(video: Video) -> dict[str, Any]:
         "like_count": video.like_count,
         "comment_count": video.comment_count,
         "thumbnail_url": video.thumbnail_url,
+        "bunny_thumbnail_url": video.bunny_thumbnail_url,
+        "bunny_thumbnail_path": video.bunny_thumbnail_path,
         "tags": _parse_tags(video.tags_json),
         "youtube_category_id": video.youtube_category_id,
         "metadata_status": video.metadata_status,
@@ -74,6 +76,8 @@ def _short_payload(short: Short) -> dict[str, Any]:
         "like_count": short.like_count,
         "comment_count": short.comment_count,
         "thumbnail_url": short.thumbnail_url,
+        "bunny_thumbnail_url": short.bunny_thumbnail_url,
+        "bunny_thumbnail_path": short.bunny_thumbnail_path,
         "tags": _parse_tags(short.tags_json),
         "youtube_category_id": short.youtube_category_id,
         "metadata_status": short.metadata_status,
@@ -97,6 +101,8 @@ def _playlist_item_payload(item: PlaylistItem) -> dict[str, Any]:
         "duration_iso": item.duration_iso,
         "duration_seconds": item.duration_seconds,
         "thumbnail_url": item.thumbnail_url,
+        "bunny_thumbnail_url": item.bunny_thumbnail_url,
+        "bunny_thumbnail_path": item.bunny_thumbnail_path,
         "metadata_status": item.metadata_status,
         "transfer_status": item.transfer_status,
         "bunny_video_id": item.bunny_path,
@@ -116,6 +122,9 @@ def _playlist_item_payload(item: PlaylistItem) -> dict[str, Any]:
             payload["duration_seconds"] or linked.get("duration_seconds")
         )
         payload["thumbnail_url"] = payload["thumbnail_url"] or linked.get("thumbnail_url")
+        payload["bunny_thumbnail_url"] = (
+            payload.get("bunny_thumbnail_url") or linked.get("bunny_thumbnail_url")
+        )
         payload["bunny_video_id"] = linked.get("bunny_video_id") or payload["bunny_video_id"]
         payload["bunny_url"] = linked.get("bunny_url") or payload["bunny_url"]
         payload["linked_video"] = linked
@@ -129,6 +138,9 @@ def _playlist_item_payload(item: PlaylistItem) -> dict[str, Any]:
             payload["duration_seconds"] or linked.get("duration_seconds")
         )
         payload["thumbnail_url"] = payload["thumbnail_url"] or linked.get("thumbnail_url")
+        payload["bunny_thumbnail_url"] = (
+            payload.get("bunny_thumbnail_url") or linked.get("bunny_thumbnail_url")
+        )
         payload["bunny_video_id"] = linked.get("bunny_video_id") or payload["bunny_video_id"]
         payload["bunny_url"] = linked.get("bunny_url") or payload["bunny_url"]
         payload["linked_short"] = linked
@@ -148,6 +160,8 @@ def _playlist_payload(playlist: Playlist) -> dict[str, Any]:
         "published_at": playlist.published_at,
         "item_count": playlist.item_count,
         "thumbnail_url": playlist.thumbnail_url,
+        "bunny_thumbnail_url": playlist.bunny_thumbnail_url,
+        "bunny_thumbnail_path": playlist.bunny_thumbnail_path,
         "metadata_status": playlist.metadata_status,
         "playlist_items": [_playlist_item_payload(item) for item in items],
     }
