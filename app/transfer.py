@@ -25,7 +25,7 @@ from app.thumbnails import (
     transfer_playlist_thumbnails,
     try_upload_thumbnail_after_transfer,
 )
-from app.utils import bunny_creator_key, creator_folder_name, utcnow
+from app.utils import bunny_creator_key, creator_folder_name, normalize_channel_ids, utcnow
 
 log = logging.getLogger(__name__)
 
@@ -308,7 +308,8 @@ def _eligible_download_videos(
     session: Session,
     *,
     retry_failed: bool,
-    channel_id: int | None,
+    channel_ids: list[int] | None = None,
+    channel_id: int | None = None,
     max_per_channel: int,
 ) -> list[Video]:
     statuses = ["pending", "failed"] if retry_failed else ["pending"]
@@ -318,8 +319,9 @@ def _eligible_download_videos(
         .filter(Video.is_short.is_(False), Video.transfer_status.in_(statuses))
         .order_by(Video.creator_row_id.asc(), Video.popular_rank.asc())
     )
-    if channel_id is not None:
-        query = query.filter(Video.creator_row_id == channel_id)
+    channel_ids = normalize_channel_ids(channel_ids, channel_id=channel_id)
+    if channel_ids is not None:
+        query = query.filter(Video.creator_row_id.in_(channel_ids))
 
     already_kept = dict(
         session.query(Video.creator_row_id, func.count(Video.id))
@@ -353,7 +355,8 @@ def _eligible_upload_videos(
     session: Session,
     *,
     retry_failed: bool,
-    channel_id: int | None,
+    channel_ids: list[int] | None = None,
+    channel_id: int | None = None,
 ) -> list[Video]:
     statuses = ["downloaded", "failed"] if retry_failed else ["downloaded"]
     query = (
@@ -362,8 +365,9 @@ def _eligible_upload_videos(
         .filter(Video.is_short.is_(False), Video.transfer_status.in_(statuses))
         .order_by(Video.creator_row_id.asc(), Video.popular_rank.asc())
     )
-    if channel_id is not None:
-        query = query.filter(Video.creator_row_id == channel_id)
+    channel_ids = normalize_channel_ids(channel_ids, channel_id=channel_id)
+    if channel_ids is not None:
+        query = query.filter(Video.creator_row_id.in_(channel_ids))
 
     selected: list[Video] = []
     for video in query.all():
@@ -386,12 +390,14 @@ def download_videos(
     settings: Settings,
     *,
     retry_failed: bool = False,
+    channel_ids: list[int] | None = None,
     channel_id: int | None = None,
 ) -> tuple[int, int]:
+    channel_ids = normalize_channel_ids(channel_ids, channel_id=channel_id)
     videos = _eligible_download_videos(
         session,
         retry_failed=retry_failed,
-        channel_id=channel_id,
+        channel_ids=channel_ids,
         max_per_channel=settings.max_videos_per_channel,
     )
     if not videos:
@@ -455,13 +461,15 @@ def upload_videos(
     settings: Settings,
     *,
     retry_failed: bool = False,
+    channel_ids: list[int] | None = None,
     channel_id: int | None = None,
 ) -> tuple[int, int]:
+    channel_ids = normalize_channel_ids(channel_ids, channel_id=channel_id)
     bunny = BunnyStream(settings)
     videos = _eligible_upload_videos(
         session,
         retry_failed=retry_failed,
-        channel_id=channel_id,
+        channel_ids=channel_ids,
     )
     session.commit()  # persist any pending->pending fixes from missing files
     if not videos:
@@ -622,7 +630,8 @@ def _eligible_transfer_videos(
     session: Session,
     *,
     retry_failed: bool,
-    channel_id: int | None,
+    channel_ids: list[int] | None = None,
+    channel_id: int | None = None,
     max_per_channel: int,
 ) -> list[Video]:
     """Videos that need download and/or upload."""
@@ -637,8 +646,9 @@ def _eligible_transfer_videos(
         .filter(Video.is_short.is_(False), Video.transfer_status.in_(statuses))
         .order_by(Video.creator_row_id.asc(), Video.popular_rank.asc())
     )
-    if channel_id is not None:
-        query = query.filter(Video.creator_row_id == channel_id)
+    channel_ids = normalize_channel_ids(channel_ids, channel_id=channel_id)
+    if channel_ids is not None:
+        query = query.filter(Video.creator_row_id.in_(channel_ids))
 
     # Only fully uploaded videos consume the per-creator quota. Counting
     # downloading/uploading/downloaded here blocked retries after crashes.
@@ -743,6 +753,7 @@ def transfer_videos(
     settings: Settings,
     *,
     retry_failed: bool = False,
+    channel_ids: list[int] | None = None,
     channel_id: int | None = None,
 ) -> tuple[int, int, int]:
     """
@@ -751,10 +762,11 @@ def transfer_videos(
     Only ``TRANSFER_CONCURRENCY`` videos are in-flight at once so disk usage
     stays bounded. Returns (uploaded, download_failed_or_upload_failed, skipped).
     """
+    channel_ids = normalize_channel_ids(channel_ids, channel_id=channel_id)
     videos = _eligible_transfer_videos(
         session,
         retry_failed=retry_failed,
-        channel_id=channel_id,
+        channel_ids=channel_ids,
         max_per_channel=settings.max_videos_per_channel,
     )
     session.commit()
@@ -921,16 +933,16 @@ def transfer_videos(
         session,
         settings,
         retry_failed=retry_failed,
-        channel_id=channel_id,
+        channel_ids=channel_ids,
     )
     p_up, p_fail = transfer_playlist_items(
         session,
         settings,
         retry_failed=retry_failed,
-        channel_id=channel_id,
+        channel_ids=channel_ids,
     )
     # Playlist covers are metadata-only (no Stream file) — upload Storage thumbs here.
-    transfer_playlist_thumbnails(session, settings, channel_id=channel_id, force=False)
+    transfer_playlist_thumbnails(session, settings, channel_ids=channel_ids, force=False)
     return uploaded + s_up + p_up, failed + s_fail + p_fail, 0
 
 
@@ -939,12 +951,14 @@ def transfer_shorts(
     settings: Settings,
     *,
     retry_failed: bool = False,
+    channel_ids: list[int] | None = None,
     channel_id: int | None = None,
 ) -> tuple[int, int]:
+    channel_ids = normalize_channel_ids(channel_ids, channel_id=channel_id)
     shorts = _eligible_transfer_shorts(
         session,
         retry_failed=retry_failed,
-        channel_id=channel_id,
+        channel_ids=channel_ids,
         max_per_channel=settings.max_shorts_per_channel,
     )
     session.commit()
@@ -1065,7 +1079,8 @@ def _eligible_transfer_shorts(
     session: Session,
     *,
     retry_failed: bool,
-    channel_id: int | None,
+    channel_ids: list[int] | None = None,
+    channel_id: int | None = None,
     max_per_channel: int,
 ) -> list[Short]:
     statuses = ["pending", "failed", "downloaded", "downloading", "uploading"]
@@ -1078,8 +1093,9 @@ def _eligible_transfer_shorts(
         .filter(Short.transfer_status.in_(statuses))
         .order_by(Short.creator_row_id.asc(), Short.shorts_rank.asc())
     )
-    if channel_id is not None:
-        query = query.filter(Short.creator_row_id == channel_id)
+    channel_ids = normalize_channel_ids(channel_ids, channel_id=channel_id)
+    if channel_ids is not None:
+        query = query.filter(Short.creator_row_id.in_(channel_ids))
 
     already_uploaded = dict(
         session.query(Short.creator_row_id, func.count(Short.id))
@@ -1138,10 +1154,12 @@ def transfer_playlist_items(
     settings: Settings,
     *,
     retry_failed: bool = False,
+    channel_ids: list[int] | None = None,
     channel_id: int | None = None,
 ) -> tuple[int, int]:
+    channel_ids = normalize_channel_ids(channel_ids, channel_id=channel_id)
     items = _eligible_transfer_playlist_items(
-        session, retry_failed=retry_failed, channel_id=channel_id
+        session, retry_failed=retry_failed, channel_ids=channel_ids
     )
     session.commit()
     if not items:
@@ -1263,7 +1281,8 @@ def _eligible_transfer_playlist_items(
     session: Session,
     *,
     retry_failed: bool,
-    channel_id: int | None,
+    channel_ids: list[int] | None = None,
+    channel_id: int | None = None,
 ) -> list[PlaylistItem]:
     """Unlinked playlist items only (already-in-videos/shorts stay skipped)."""
     statuses = ["pending", "failed", "downloaded", "downloading", "uploading"]
@@ -1278,8 +1297,9 @@ def _eligible_transfer_playlist_items(
         )
         .order_by(PlaylistItem.creator_row_id.asc(), PlaylistItem.position.asc())
     )
-    if channel_id is not None:
-        query = query.filter(PlaylistItem.creator_row_id == channel_id)
+    channel_ids = normalize_channel_ids(channel_ids, channel_id=channel_id)
+    if channel_ids is not None:
+        query = query.filter(PlaylistItem.creator_row_id.in_(channel_ids))
 
     selected: list[PlaylistItem] = []
     for item in query.all():

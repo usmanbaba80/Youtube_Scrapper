@@ -9,7 +9,7 @@ from sqlalchemy.orm import Session, joinedload
 
 from app.config import PROJECT_ROOT, Settings
 from app.models import Creator, Playlist, PlaylistItem, Short, Video
-from app.utils import slugify
+from app.utils import normalize_channel_ids, slugify
 
 log = logging.getLogger(__name__)
 
@@ -271,21 +271,23 @@ def export_jsons(
     session: Session,
     settings: Settings,
     *,
+    channel_ids: list[int] | None = None,
     channel_id: int | None = None,
     output_dir: Path | None = None,
 ) -> list[Path]:
     """
-    Export JSON packs for all creators, or one creator via channel_id
-    (creators.id row PK, same as --channel-id elsewhere).
+    Export JSON packs for all creators, or selected creators via channel_ids
+    (creators.id row PKs, same as --channel-id elsewhere).
     """
+    channel_ids = normalize_channel_ids(channel_ids, channel_id=channel_id)
     query = session.query(Creator).order_by(Creator.id.asc())
-    if channel_id is not None:
-        query = query.filter(Creator.id == channel_id)
+    if channel_ids is not None:
+        query = query.filter(Creator.id.in_(channel_ids))
     creators = query.all()
     if not creators:
         raise RuntimeError(
             f"No creators found"
-            + (f" for channel-id={channel_id}" if channel_id is not None else "")
+            + (f" for channel-id={channel_ids}" if channel_ids is not None else "")
         )
 
     root = output_dir or (PROJECT_ROOT / "data" / "exports")

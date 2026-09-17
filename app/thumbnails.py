@@ -10,7 +10,7 @@ from sqlalchemy.orm import Session, joinedload
 from app.config import Settings
 from app.models import Creator, Playlist, PlaylistItem, Short, Video
 from app.storage import BunnyStorage
-from app.utils import bunny_creator_key
+from app.utils import bunny_creator_key, normalize_channel_ids
 
 log = logging.getLogger(__name__)
 
@@ -204,6 +204,7 @@ def transfer_playlist_thumbnails(
     session: Session,
     settings: Settings,
     *,
+    channel_ids: list[int] | None = None,
     channel_id: int | None = None,
     force: bool = False,
 ) -> tuple[int, int, int]:
@@ -214,6 +215,7 @@ def transfer_playlist_thumbnails(
     from video/short/playlist-item post-transfer hooks.
     Returns (uploaded, failed, skipped).
     """
+    channel_ids = normalize_channel_ids(channel_ids, channel_id=channel_id)
     if not settings.bunny_storage_zone or not settings.bunny_storage_password:
         log.warning("Bunny Storage not configured; skipping playlist thumbnails")
         return 0, 0, 0
@@ -227,8 +229,9 @@ def transfer_playlist_thumbnails(
         pq = pq.filter(
             (Playlist.bunny_thumbnail_url.is_(None)) | (Playlist.bunny_thumbnail_url == "")
         )
-    if channel_id is not None:
-        pq = pq.filter(Playlist.creator_row_id == channel_id)
+    channel_ids = normalize_channel_ids(channel_ids, channel_id=channel_id)
+    if channel_ids is not None:
+        pq = pq.filter(Playlist.creator_row_id.in_(channel_ids))
 
     playlists = pq.order_by(Playlist.id.asc()).all()
     if not playlists:
@@ -238,7 +241,7 @@ def transfer_playlist_thumbnails(
     log.info(
         "Uploading thumbnails for %s playlist cover(s)%s",
         len(playlists),
-        f" (channel_id={channel_id})" if channel_id is not None else "",
+        f" (channel_ids={channel_ids})" if channel_ids is not None else "",
     )
     for playlist in playlists:
         creator = playlist.creator
@@ -306,6 +309,7 @@ def transfer_thumbnails(
     session: Session,
     settings: Settings,
     *,
+    channel_ids: list[int] | None = None,
     channel_id: int | None = None,
     retry_failed: bool = False,
     force: bool = False,
@@ -319,6 +323,7 @@ def transfer_thumbnails(
     Skips rows that already have bunny_thumbnail_url unless force=True.
     Use this to complete a partial set (some present, some missing).
     """
+    channel_ids = normalize_channel_ids(channel_ids, channel_id=channel_id)
     if not settings.bunny_storage_zone or not settings.bunny_storage_password:
         log.warning("Bunny Storage not configured; skipping thumbnails")
         return 0, 0, 0
@@ -328,8 +333,8 @@ def transfer_thumbnails(
     skipped = 0
 
     def _creator_filter(query):
-        if channel_id is not None:
-            return query.filter(Creator.id == channel_id)
+        if channel_ids is not None:
+            return query.filter(Creator.id.in_(channel_ids))
         return query
 
     # Videos
@@ -399,7 +404,7 @@ def transfer_thumbnails(
     p_up, p_fail, p_skip = transfer_playlist_thumbnails(
         session,
         settings,
-        channel_id=channel_id,
+        channel_ids=channel_ids,
         force=force,
     )
     uploaded += p_up
@@ -419,8 +424,8 @@ def transfer_thumbnails(
             (PlaylistItem.bunny_thumbnail_url.is_(None))
             | (PlaylistItem.bunny_thumbnail_url == "")
         )
-    if channel_id is not None:
-        iq = iq.filter(PlaylistItem.creator_row_id == channel_id)
+    if channel_ids is not None:
+        iq = iq.filter(PlaylistItem.creator_row_id.in_(channel_ids))
     for item in iq.order_by(PlaylistItem.id.asc()).all():
         creator = item.playlist.creator if item.playlist else None
         if creator is None:

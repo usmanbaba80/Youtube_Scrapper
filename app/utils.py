@@ -58,6 +58,53 @@ def bunny_creator_key(creator) -> str:
     return creator_folder_name(creator)
 
 
+def parse_channel_ids(raw: str | None) -> list[int] | None:
+    """
+    Parse ``--channel-id`` values: ``3``, ``3,4,5``, or ``3 4 5``.
+    Returns None when unset (meaning: all creators).
+    """
+    if raw is None:
+        return None
+    text = str(raw).strip()
+    if not text:
+        return None
+    ids: list[int] = []
+    for part in re.split(r"[,\s]+", text):
+        if not part:
+            continue
+        try:
+            value = int(part)
+        except ValueError as exc:
+            raise ValueError(
+                f"Invalid channel id {part!r}; expected integers like 3,4,5"
+            ) from exc
+        if value <= 0:
+            raise ValueError(f"Invalid channel id {value}; must be a positive creators.id")
+        ids.append(value)
+    # Preserve order, drop duplicates
+    return list(dict.fromkeys(ids)) or None
+
+
+def normalize_channel_ids(
+    channel_ids: list[int] | tuple[int, ...] | int | None = None,
+    *,
+    channel_id: int | None = None,
+) -> list[int] | None:
+    """Normalize CLI/kwargs into a list of creators.id PKs (or None = all)."""
+    if channel_ids is None and channel_id is None:
+        return None
+    if isinstance(channel_ids, int):
+        values = [channel_ids]
+    elif channel_ids is not None:
+        values = list(channel_ids)
+    else:
+        values = []
+    if channel_id is not None:
+        values.append(channel_id)
+    cleaned = [int(v) for v in values if v is not None]
+    return list(dict.fromkeys(cleaned)) or None
+
+
 def parse_sheet_category_id(sheet_title: str) -> int | None:
     """Extract category id from sheet title brackets, e.g. 'Kids - MiniMinds (1)' -> 1."""
     match = re.search(r"\((\d+)\)\s*$", (sheet_title or "").strip())

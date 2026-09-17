@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import logging
+import sys
 from dataclasses import replace
 from pathlib import Path
 
@@ -19,6 +20,7 @@ from app.pipeline import (
     run_transfer,
     run_upload,
 )
+from app.utils import parse_channel_ids
 
 
 def setup_logging() -> None:
@@ -57,8 +59,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--excel", type=Path, help="Override Excel workbook path")
     parser.add_argument(
         "--channel-id",
-        type=int,
-        help="Only process this creators.id (DB row PK)",
+        type=str,
+        help=(
+            "Only process these creators.id values (DB row PKs). "
+            "One id or comma/space-separated list, e.g. 3 or 3,4,5"
+        ),
     )
     parser.add_argument(
         "--output-dir",
@@ -89,6 +94,12 @@ def main() -> None:
         excel = args.excel if args.excel.is_absolute() else PROJECT_ROOT / args.excel
         settings = replace(settings, excel_path=excel)
 
+    try:
+        channel_ids = parse_channel_ids(args.channel_id)
+    except ValueError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        raise SystemExit(2) from exc
+
     engine = make_engine(settings)
     init_db(engine)
     factory = make_session_factory(engine)
@@ -99,7 +110,7 @@ def main() -> None:
             settings,
             retry_failed=args.retry_failed,
             force=args.force,
-            channel_id=args.channel_id,
+            channel_ids=channel_ids,
         )
         return
 
@@ -112,7 +123,7 @@ def main() -> None:
                 settings,
                 retry_failed=args.retry_failed,
                 force=args.force,
-                channel_id=args.channel_id,
+                channel_ids=channel_ids,
             )
         elif args.command == "metadata":
             run_metadata(session, settings, retry_failed=args.retry_failed)
@@ -121,27 +132,27 @@ def main() -> None:
                 session,
                 settings,
                 retry_failed=args.retry_failed,
-                channel_id=args.channel_id,
+                channel_ids=channel_ids,
             )
         elif args.command == "upload":
             run_upload(
                 session,
                 settings,
                 retry_failed=args.retry_failed,
-                channel_id=args.channel_id,
+                channel_ids=channel_ids,
             )
         elif args.command == "transfer":
             run_transfer(
                 session,
                 settings,
                 retry_failed=args.retry_failed,
-                channel_id=args.channel_id,
+                channel_ids=channel_ids,
             )
         elif args.command == "thumbnails":
             run_thumbnails(
                 session,
                 settings,
-                channel_id=args.channel_id,
+                channel_ids=channel_ids,
                 retry_failed=args.retry_failed,
                 force=args.force,
             )
@@ -152,7 +163,7 @@ def main() -> None:
             run_export_json(
                 session,
                 settings,
-                channel_id=args.channel_id,
+                channel_ids=channel_ids,
                 output_dir=out,
             )
         elif args.command == "status":

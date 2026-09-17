@@ -82,6 +82,7 @@ def run_transfer(session: Session, settings: Settings, **kwargs) -> None:
     t_up, t_fail, t_skip = transfer_thumbnails(
         session,
         settings,
+        channel_ids=kwargs.get("channel_ids"),
         channel_id=kwargs.get("channel_id"),
         force=False,
     )
@@ -109,8 +110,12 @@ def run_all(
     *,
     retry_failed: bool = False,
     force: bool = False,
+    channel_ids: list[int] | None = None,
     channel_id: int | None = None,
 ) -> None:
+    from app.utils import normalize_channel_ids
+
+    channel_ids = normalize_channel_ids(channel_ids, channel_id=channel_id)
     with factory() as session:
         run_load_excel(session, settings)
         session.commit()
@@ -119,7 +124,7 @@ def run_all(
             settings,
             retry_failed=retry_failed,
             force=force,
-            channel_id=channel_id,
+            channel_ids=channel_ids,
         )
         session.commit()
         run_metadata(session, settings, retry_failed=retry_failed)
@@ -128,13 +133,13 @@ def run_all(
             session,
             settings,
             retry_failed=retry_failed,
-            channel_id=channel_id,
+            channel_ids=channel_ids,
         )
         session.commit()
         run_thumbnails(
             session,
             settings,
-            channel_id=channel_id,
+            channel_ids=channel_ids,
             force=False,
         )
 

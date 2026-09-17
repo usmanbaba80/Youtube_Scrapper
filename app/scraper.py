@@ -11,6 +11,7 @@ from app.models import Creator, Playlist, PlaylistItem, Short, Video
 from app.playlists import fetch_channel_playlists, fetch_playlist_items
 from app.popular import fetch_channel_shorts, fetch_popular_videos
 from app.utils import (
+    normalize_channel_ids,
     build_playlist_id,
     build_short_id,
     build_video_id,
@@ -371,11 +372,13 @@ def scrape_all_creators(
     *,
     retry_failed: bool = False,
     force: bool = False,
+    channel_ids: list[int] | None = None,
     channel_id: int | None = None,
 ) -> tuple[int, int]:
+    channel_ids = normalize_channel_ids(channel_ids, channel_id=channel_id)
     query = session.query(Creator)
-    if channel_id is not None:
-        query = query.filter(Creator.id == channel_id)
+    if channel_ids is not None:
+        query = query.filter(Creator.id.in_(channel_ids))
     elif force:
         pass
     elif retry_failed:
