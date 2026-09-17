@@ -35,13 +35,27 @@ def slugify(value: str, fallback: str = "item") -> str:
 
 
 def creator_folder_name(creator) -> str:
-    """Filesystem/Bunny-safe folder name for a creator row."""
-    raw = (getattr(creator, "handle", None) or getattr(creator, "name", None) or f"creator-{getattr(creator, 'id', 'x')}")
+    """Filesystem-safe local download folder for a creator row (handle preferred)."""
+    raw = (
+        getattr(creator, "handle", None)
+        or getattr(creator, "name", None)
+        or f"creator-{getattr(creator, 'id', 'x')}"
+    )
     raw = str(raw).lstrip("@").strip()
     cleaned = re.sub(r'[<>:"/\\|?*\x00-\x1f]', "", raw)
     cleaned = re.sub(r"\s+", "-", cleaned).strip(" .-_")
     cid = getattr(creator, "id", "x")
     return cleaned[:120] or f"creator-{cid}"
+
+
+def bunny_creator_key(creator) -> str:
+    """
+    Shared Bunny folder key for Stream collections AND Storage thumbnails.
+
+    Prefer YouTube handle so Stream (`Pinkfong/videos`) and Storage
+    (`.../Pinkfong/thumbnails/...`) always match. Falls back to display name.
+    """
+    return creator_folder_name(creator)
 
 
 def parse_sheet_category_id(sheet_title: str) -> int | None:

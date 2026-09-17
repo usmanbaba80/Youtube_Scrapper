@@ -24,12 +24,13 @@ class BunnyStorage:
 
     Path layout for thumbnails only (BUNNY_ROOT_PATH + creator_id):
 
-      {root}/{CreatorName}/thumbnails/videos/{id}.jpg
-      {root}/{CreatorName}/thumbnails/shorts/{id}.jpg
-      {root}/{CreatorName}/thumbnails/playlists/{id}.jpg
-      {root}/{CreatorName}/thumbnails/playlist-items/{youtube_video_id}.jpg
+      {root}/{CreatorKey}/thumbnails/videos/{id}.jpg
+      {root}/{CreatorKey}/thumbnails/shorts/{id}.jpg
+      {root}/{CreatorKey}/thumbnails/playlists/{id}.jpg
+      {root}/{CreatorKey}/thumbnails/playlist-items/{youtube_video_id}.jpg
 
-    Stream video uploads use a different layout: {CreatorName}/videos|shorts|playlists
+    Stream video uploads use a different layout: {CreatorKey}/videos|shorts|playlists
+    (same CreatorKey = YouTube handle preferred).
     """
 
     def __init__(self, settings: Settings) -> None:

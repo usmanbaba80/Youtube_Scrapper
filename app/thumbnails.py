@@ -10,10 +10,21 @@ from sqlalchemy.orm import Session, joinedload
 from app.config import Settings
 from app.models import Creator, Playlist, PlaylistItem, Short, Video
 from app.storage import BunnyStorage
+from app.utils import bunny_creator_key
 
 log = logging.getLogger(__name__)
 
 _EXT_RE = re.compile(r"\.(jpe?g|png|webp|gif)(?:\?|$)", re.I)
+# YouTube placeholder covers 404; never treat these as real images.
+_BAD_THUMB_MARKERS = ("no_thumbnail", "default_thumbnail", "/img/no_")
+
+
+def _is_usable_thumbnail_url(url: str | None) -> bool:
+    text = (url or "").strip()
+    if not text.startswith(("http://", "https://")):
+        return False
+    lower = text.lower()
+    return not any(marker in lower for marker in _BAD_THUMB_MARKERS)
 
 
 def _guess_ext(url: str, content_type: str | None) -> str:
@@ -54,13 +65,11 @@ def _storage_path(settings: Settings, creator: Creator, kind: str, public_id: st
     """
     Thumbnails only (Bunny Storage):
 
-      Kids Apps/VoD - Roku TV/{CreatorName}/thumbnails/{videos|shorts|playlists|playlist-items}/{id}.ext
+      Kids Apps/VoD - Roku TV/{CreatorKey}/thumbnails/{videos|shorts|playlists|playlist-items}/{id}.ext
+
+    CreatorKey matches Stream folders (YouTube handle preferred), e.g. Pinkfong.
     """
-    # Same display name as Stream folders (e.g. "Peppa Pig").
-    creator_part = (
-        (creator.name or creator.handle or f"creator-{creator.id}").strip().lstrip("@").strip()
-        or f"creator-{creator.id}"
-    )
+    creator_part = bunny_creator_key(creator)
     root = (settings.bunny_root_path or "").strip().strip("/")
     base = f"{root}/{creator_part}" if root else creator_part
     safe_id = re.sub(r"[^\w.\-]+", "_", public_id)[:120] or "item"
@@ -102,6 +111,7 @@ def sync_row_thumbnail(
     kind: str,
     public_id: str,
     force: bool = False,
+    source_url: str | None = None,
 ) -> bool:
     """
     Download YouTube thumbnail_url and upload to Bunny Storage.
@@ -109,9 +119,9 @@ def sync_row_thumbnail(
     """
     if not force and row.bunny_thumbnail_url:
         return False
-    source = (row.thumbnail_url or "").strip()
-    if not source:
-        raise RuntimeError("no YouTube thumbnail_url on row")
+    source = (source_url or row.thumbnail_url or "").strip()
+    if not _is_usable_thumbnail_url(source):
+        raise RuntimeError(f"no usable YouTube thumbnail_url on row ({source or 'empty'})")
     result = upload_thumbnail_from_url(
         settings,
         creator=creator,
@@ -121,6 +131,73 @@ def sync_row_thumbnail(
     )
     _apply_thumb(row, result)
     return True
+
+
+def _item_source_thumbnail_url(item: PlaylistItem) -> str | None:
+    """Best YouTube thumb URL for a playlist item (own row or linked video/short)."""
+    candidates = [item.thumbnail_url]
+    if item.video is not None:
+        candidates.append(item.video.thumbnail_url)
+    if item.short is not None:
+        candidates.append(item.short.thumbnail_url)
+    for url in candidates:
+        if _is_usable_thumbnail_url(url):
+            return (url or "").strip()
+    return None
+
+
+def _item_bunny_thumbnail(item: PlaylistItem) -> tuple[str | None, str | None]:
+    """Reuse an already-uploaded Bunny thumb from the item or its linked media."""
+    for row in (item, item.video, item.short):
+        if row is None:
+            continue
+        url = (getattr(row, "bunny_thumbnail_url", None) or "").strip()
+        if url:
+            path = (getattr(row, "bunny_thumbnail_path", None) or "").strip() or None
+            return url, path
+    return None, None
+
+
+def resolve_playlist_cover_source(
+    session: Session,
+    playlist: Playlist,
+) -> tuple[str | None, str | None]:
+    """
+    Resolve a usable cover image for a playlist.
+
+    Returns (youtube_source_url, already_on_bunny_cdn_url).
+    Prefers the playlist's own thumb; if YouTube used the no_thumbnail placeholder,
+    falls back to the first playlist item (or its linked video/short).
+    """
+    if _is_usable_thumbnail_url(playlist.thumbnail_url):
+        return (playlist.thumbnail_url or "").strip(), None
+
+    # Clear stored placeholder so status/queries don't keep treating it as real.
+    if playlist.thumbnail_url and not _is_usable_thumbnail_url(playlist.thumbnail_url):
+        playlist.thumbnail_url = None
+
+    items = (
+        session.query(PlaylistItem)
+        .options(
+            joinedload(PlaylistItem.video),
+            joinedload(PlaylistItem.short),
+        )
+        .filter(PlaylistItem.playlist_row_id == playlist.id)
+        .order_by(PlaylistItem.position.asc())
+        .all()
+    )
+    for item in items:
+        bunny_url, _bunny_path = _item_bunny_thumbnail(item)
+        if bunny_url:
+            # Prefer re-uploading from YouTube into playlists/ path when possible.
+            yt = _item_source_thumbnail_url(item)
+            if yt:
+                return yt, None
+            return None, bunny_url
+        yt = _item_source_thumbnail_url(item)
+        if yt:
+            return yt, None
+    return None, None
 
 
 def transfer_playlist_thumbnails(
@@ -145,11 +222,7 @@ def transfer_playlist_thumbnails(
     failed = 0
     skipped = 0
 
-    pq = (
-        session.query(Playlist)
-        .options(joinedload(Playlist.creator))
-        .filter(Playlist.thumbnail_url.isnot(None), Playlist.thumbnail_url != "")
-    )
+    pq = session.query(Playlist).options(joinedload(Playlist.creator))
     if not force:
         pq = pq.filter(
             (Playlist.bunny_thumbnail_url.is_(None)) | (Playlist.bunny_thumbnail_url == "")
@@ -172,25 +245,51 @@ def transfer_playlist_thumbnails(
         if creator is None:
             failed += 1
             continue
+        public_id = playlist.playlist_id or playlist.youtube_playlist_id
         try:
-            if sync_row_thumbnail(
-                settings,
-                creator,
-                playlist,
-                kind="playlists",
-                public_id=playlist.playlist_id or playlist.youtube_playlist_id,
-                force=force,
-            ):
-                uploaded += 1
-            else:
+            if not force and playlist.bunny_thumbnail_url:
                 skipped += 1
+                continue
+
+            yt_url, bunny_reuse = resolve_playlist_cover_source(session, playlist)
+            if yt_url:
+                if sync_row_thumbnail(
+                    settings,
+                    creator,
+                    playlist,
+                    kind="playlists",
+                    public_id=public_id,
+                    force=force,
+                    source_url=yt_url,
+                ):
+                    # Persist resolved cover on the playlist row when original was missing.
+                    if not _is_usable_thumbnail_url(playlist.thumbnail_url):
+                        playlist.thumbnail_url = yt_url
+                    uploaded += 1
+                else:
+                    skipped += 1
+            elif bunny_reuse:
+                # No YouTube image, but an item already has a Bunny thumb — reuse CDN URL.
+                playlist.bunny_thumbnail_url = bunny_reuse
+                uploaded += 1
+                log.info(
+                    "Playlist %s cover reused existing Bunny thumb %s",
+                    public_id,
+                    bunny_reuse,
+                )
+            else:
+                failed += 1
+                log.warning(
+                    "No usable thumbnail for playlist %s (YouTube placeholder / empty cover)",
+                    public_id,
+                )
             session.commit()
         except Exception as exc:
             session.rollback()
             failed += 1
-            log.exception(
+            log.warning(
                 "Thumbnail failed for playlist %s: %s",
-                playlist.playlist_id or playlist.youtube_playlist_id,
+                public_id,
                 exc,
             )
 
@@ -369,7 +468,7 @@ def try_upload_thumbnail_after_transfer(
     try:
         if not settings.bunny_storage_zone or not settings.bunny_storage_password:
             return
-        if not (row.thumbnail_url or "").strip():
+        if not _is_usable_thumbnail_url(row.thumbnail_url):
             return
         if row.bunny_thumbnail_url:
             return

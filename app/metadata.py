@@ -66,7 +66,14 @@ def _thumb_url(snippet: dict) -> str | None:
         or thumbnails.get("default")
         or {}
     )
-    return thumb.get("url")
+    url = thumb.get("url")
+    if not url:
+        return None
+    # YouTube placeholder covers 404 — do not persist them.
+    lower = url.lower()
+    if "no_thumbnail" in lower or "/img/no_" in lower:
+        return None
+    return url
 
 
 def apply_metadata(video: Video, item: dict) -> None:

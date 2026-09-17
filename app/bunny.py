@@ -78,12 +78,13 @@ class BunnyStream:
     """
     Upload into Bunny Stream using creator-name folder collections:
 
-        {CreatorName}/videos
-        {CreatorName}/shorts
-        {CreatorName}/playlists
+        {CreatorKey}/videos
+        {CreatorKey}/shorts
+        {CreatorKey}/playlists
 
     Stream has no nested collections API, so the slash is part of the name.
     Thumbnail Storage uses BUNNY_ROOT_PATH separately (see BunnyStorage / thumbnails).
+    CreatorKey matches Storage (YouTube handle preferred).
     """
 
     def __init__(self, settings: Settings) -> None:

@@ -25,7 +25,7 @@ from app.thumbnails import (
     transfer_playlist_thumbnails,
     try_upload_thumbnail_after_transfer,
 )
-from app.utils import creator_folder_name, utcnow
+from app.utils import bunny_creator_key, creator_folder_name, utcnow
 
 log = logging.getLogger(__name__)
 
@@ -57,8 +57,8 @@ def creator_display_name(creator: Creator) -> str:
 
 
 def stream_creator_key(creator: Creator) -> str:
-    """Bunny Stream folder key: creator display name (e.g. Peppa Pig/videos)."""
-    return creator_display_name(creator)
+    """Bunny Stream folder key — same as Storage thumbnail folders."""
+    return bunny_creator_key(creator)
 
 
 def _resolve_js_runtimes(settings: Settings) -> dict[str, dict]:

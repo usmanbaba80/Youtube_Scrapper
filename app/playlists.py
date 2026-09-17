@@ -58,6 +58,9 @@ def fetch_channel_playlists(
                 or thumbs.get("default")
                 or {}
             )
+            thumb_url = thumb.get("url")
+            if thumb_url and ("no_thumbnail" in thumb_url.lower() or "/img/no_" in thumb_url.lower()):
+                thumb_url = None
             items.append(
                 {
                     "youtube_playlist_id": yt_id,
@@ -66,7 +69,7 @@ def fetch_channel_playlists(
                     "description": snippet.get("description"),
                     "published_at": snippet.get("publishedAt"),
                     "item_count": details.get("itemCount"),
-                    "thumbnail_url": thumb.get("url"),
+                    "thumbnail_url": thumb_url,
                     "raw": item,
                 }
             )
