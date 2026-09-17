@@ -15,11 +15,12 @@ class BunnyStorage:
     """
     Upload files into a Bunny.net Storage Zone.
 
-    Path layout (mirrors Stream folders):
-      {CreatorName}/thumbnails/videos/{id}.jpg
-      {CreatorName}/thumbnails/shorts/{id}.jpg
-      {CreatorName}/thumbnails/playlists/{id}.jpg
-      {CreatorName}/thumbnails/playlist-items/{youtube_video_id}.jpg
+    Path layout under BUNNY_ROOT_PATH (default Kids Apps/VoD - Roku TV):
+
+      {root}/{CreatorName}/thumbnails/videos/{id}.jpg
+      {root}/{CreatorName}/thumbnails/shorts/{id}.jpg
+      {root}/{CreatorName}/thumbnails/playlists/{id}.jpg
+      {root}/{CreatorName}/thumbnails/playlist-items/{youtube_video_id}.jpg
     """
 
     def __init__(self, settings: Settings) -> None:

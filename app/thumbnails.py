@@ -51,10 +51,15 @@ def _download_thumbnail(url: str) -> tuple[bytes, str]:
     return data, ext
 
 
-def _storage_path(creator: Creator, kind: str, public_id: str, ext: str) -> str:
-    root = creator_folder_name(creator)
+def _storage_path(settings: Settings, creator: Creator, kind: str, public_id: str, ext: str) -> str:
+    """
+    Kids Apps/VoD - Roku TV/{Creator}/thumbnails/{videos|shorts|playlists|playlist-items}/{id}.ext
+    """
+    creator_part = creator_folder_name(creator)
+    root = (settings.bunny_root_path or "").strip().strip("/")
+    base = f"{root}/{creator_part}" if root else creator_part
     safe_id = re.sub(r"[^\w.\-]+", "_", public_id)[:120] or "item"
-    return f"{root}/thumbnails/{kind}/{safe_id}.{ext}"
+    return f"{base}/thumbnails/{kind}/{safe_id}.{ext}"
 
 
 def upload_thumbnail_from_url(
@@ -73,7 +78,7 @@ def upload_thumbnail_from_url(
         "webp": "image/webp",
         "gif": "image/gif",
     }.get(ext, "application/octet-stream")
-    remote = _storage_path(creator, kind, public_id, ext)
+    remote = _storage_path(settings, creator, kind, public_id, ext)
     result = storage.upload_bytes(remote, data, content_type)
     log.info("Thumbnail uploaded %s -> %s", public_id, result["cdn_url"])
     return result

@@ -4,6 +4,8 @@ import os
 from dataclasses import dataclass
 from pathlib import Path
 
+from urllib.parse import unquote
+
 from dotenv import load_dotenv
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
@@ -12,6 +14,16 @@ load_dotenv(PROJECT_ROOT / ".env")
 
 def _env(name: str, default: str = "") -> str:
     return (os.getenv(name, default) or default).strip()
+
+
+def normalize_bunny_root_path(raw: str) -> str:
+    """
+    Normalize Bunny folder prefix, e.g.
+      Kids%20Apps%2FVoD%20-%20Roku%20TV  ->  Kids Apps/VoD - Roku TV
+    """
+    text = unquote((raw or "").strip()).replace("\\", "/")
+    parts = [p.strip() for p in text.split("/") if p.strip()]
+    return "/".join(parts)
 
 
 def _env_int(name: str, default: int) -> int:
@@ -57,6 +69,7 @@ class Settings:
     bunny_storage_password: str
     bunny_storage_hostname: str
     bunny_storage_cdn_hostname: str
+    bunny_root_path: str
     upload_concurrency: int
     transfer_concurrency: int
     database_url: str
@@ -101,6 +114,9 @@ def load_settings() -> Settings:
         bunny_storage_password=_env("BUNNY_STORAGE_PASSWORD"),
         bunny_storage_hostname=_env("BUNNY_STORAGE_HOSTNAME", "storage.bunnycdn.com"),
         bunny_storage_cdn_hostname=_env("BUNNY_STORAGE_CDN_HOSTNAME"),
+        bunny_root_path=normalize_bunny_root_path(
+            _env("BUNNY_ROOT_PATH", "Kids Apps/VoD - Roku TV")
+        ),
         upload_concurrency=max(1, _env_int("UPLOAD_CONCURRENCY", 3)),
         # How many videos may be mid download+upload at once (limits disk use).
         transfer_concurrency=max(1, _env_int("TRANSFER_CONCURRENCY", 2)),

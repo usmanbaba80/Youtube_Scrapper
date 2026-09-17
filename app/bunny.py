@@ -76,11 +76,11 @@ class _ProgressReader:
 
 class BunnyStream:
     """
-    Upload into Bunny Stream using creator folder collections:
+    Upload into Bunny Stream using creator folder collections under BUNNY_ROOT_PATH:
 
-        {CreatorName}/videos
-        {CreatorName}/shorts
-        {CreatorName}/playlists
+        Kids Apps/VoD - Roku TV/{CreatorName}/videos
+        Kids Apps/VoD - Roku TV/{CreatorName}/shorts
+        Kids Apps/VoD - Roku TV/{CreatorName}/playlists
 
     Stream has no nested collections API, so the slash is part of the name.
     """
@@ -104,13 +104,26 @@ class BunnyStream:
     def _url(self, path: str) -> str:
         return f"{STREAM_API}/library/{self.library_id}/{path.lstrip('/')}"
 
-    @staticmethod
-    def collection_name(creator_name: str, folder: str) -> str:
-        root = (creator_name or "Unknown Creator").strip() or "Unknown Creator"
+    def creator_base_path(self, creator_name: str) -> str:
+        """Kids Apps/VoD - Roku TV/{CreatorName} (or just CreatorName if root empty)."""
+        creator = (creator_name or "Unknown Creator").strip() or "Unknown Creator"
+        root = (self.settings.bunny_root_path or "").strip().strip("/")
+        if root:
+            return f"{root}/{creator}"
+        return creator
+
+    def collection_name(self, creator_name: str, folder: str) -> str:
+        """
+        Stream collection name (flat API; slash encodes folders):
+
+          Kids Apps/VoD - Roku TV/{Creator}/videos
+          Kids Apps/VoD - Roku TV/{Creator}/shorts
+          Kids Apps/VoD - Roku TV/{Creator}/playlists
+        """
         folder = (folder or FOLDER_VIDEOS).strip().strip("/")
         if folder not in CREATOR_FOLDERS:
             raise ValueError(f"Unknown folder {folder!r}; expected one of {CREATOR_FOLDERS}")
-        return f"{root}/{folder}"
+        return f"{self.creator_base_path(creator_name)}/{folder}"
 
     def collection_exists(self, collection_id: str) -> bool:
         if not collection_id:
@@ -121,6 +134,18 @@ class BunnyStream:
         )
         return response.status_code == 200
 
+    def _collection_name_for_id(self, collection_id: str) -> str | None:
+        if not collection_id:
+            return None
+        response = self.session.get(
+            self._url(f"collections/{collection_id}"),
+            timeout=60,
+        )
+        if response.status_code != 200:
+            return None
+        data = response.json() or {}
+        return data.get("name") or data.get("Name")
+
     def ensure_folder_collection(
         self,
         creator_name: str,
@@ -128,23 +153,33 @@ class BunnyStream:
         *,
         preferred_id: str | None = None,
     ) -> str:
-        """Return collection GUID for CreatorName/{folder}, creating if needed."""
+        """Return collection GUID for {root}/{Creator}/{folder}, creating if needed."""
         name = self.collection_name(creator_name, folder)
         cache_key = name.casefold()
         cached = self._collection_cache.get(cache_key)
         if cached:
             return cached
 
-        if preferred_id and self.collection_exists(preferred_id):
-            self._collection_cache[cache_key] = preferred_id
-            log.info("Using stored Stream collection %r (%s)", name, preferred_id)
-            return preferred_id
+        # Only reuse preferred_id when it still points at the expected folder name.
         if preferred_id:
-            log.warning(
-                "Stored Stream collection %s for %r no longer exists; recreating",
-                preferred_id,
-                name,
-            )
+            existing_name = self._collection_name_for_id(preferred_id)
+            if existing_name and existing_name.casefold() == name.casefold():
+                self._collection_cache[cache_key] = preferred_id
+                log.info("Using stored Stream collection %r (%s)", name, preferred_id)
+                return preferred_id
+            if existing_name:
+                log.info(
+                    "Stored collection %s is %r; expected %r — creating/finding new folder",
+                    preferred_id,
+                    existing_name,
+                    name,
+                )
+            else:
+                log.warning(
+                    "Stored Stream collection %s for %r no longer exists; recreating",
+                    preferred_id,
+                    name,
+                )
 
         existing = self._find_collection_by_name(name)
         if existing:
