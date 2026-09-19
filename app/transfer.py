@@ -25,7 +25,13 @@ from app.thumbnails import (
     transfer_playlist_thumbnails,
     try_upload_thumbnail_after_transfer,
 )
-from app.utils import bunny_creator_key, creator_folder_name, normalize_channel_ids, utcnow
+from app.utils import (
+    bunny_creator_key,
+    creator_folder_name,
+    normalize_channel_ids,
+    parse_media_types,
+    utcnow,
+)
 
 log = logging.getLogger(__name__)
 
@@ -124,6 +130,23 @@ def _reject_live_or_premiere(info: dict, *, incomplete: bool = False) -> str | N
     return None
 
 
+def _prefer_english_audio() -> str:
+    """
+    Multi-track audio preference for yt-dlp:
+      1) English (en / en-US / …)
+      2) original-language track when marked as such
+      3) best remaining audio (usually the default/original)
+    """
+    return (
+        "ba[language^=en][ext=m4a]/"
+        "ba[language^=en]/"
+        "ba[language=original]/"
+        "ba[format_note*=original]/"
+        "ba[ext=m4a]/"
+        "ba"
+    )
+
+
 def _ytdlp_download_opts(settings: Settings, output_dir: Path) -> dict:
     js_runtimes = _resolve_js_runtimes(settings)
     ffmpeg_location = _resolve_ffmpeg_location(settings)
@@ -140,22 +163,22 @@ def _ytdlp_download_opts(settings: Settings, output_dir: Path) -> dict:
     max_h = max(settings.ytdlp_max_height, 360)
     # Prefer target height (default 1080), then next-best, then any.
     # Do NOT use web/android alone — they often only expose 360p without PO tokens.
+    # Audio: English first, then original/best when English is missing.
+    audio = _prefer_english_audio()
     format_selector = settings.ytdlp_format
     if format_selector == "bv*+ba/b":
         prefer = min(max_h, 1080)
         format_selector = (
-            f"bv*[height>={prefer}][height<=?{max_h}]+ba[ext=m4a]/"
-            f"bv*[height>={prefer}][height<=?{max_h}]+ba/"
-            f"bv*[height>=720][height<=?{max_h}]+ba[ext=m4a]/"
-            f"bv*[height>=720][height<=?{max_h}]+ba/"
-            f"bv*[height<=?{max_h}]+ba/"
-            "bv*+ba/b"
+            f"bv*[height>={prefer}][height<=?{max_h}]+({audio})/"
+            f"bv*[height>=720][height<=?{max_h}]+({audio})/"
+            f"bv*[height<=?{max_h}]+({audio})/"
+            f"bv*+({audio})/b"
         )
 
     opts: dict = {
         "format": format_selector,
-        # Higher resolution wins (do not use res:N — that prefers closest-to-N).
-        "format_sort": ["res", "vbr", "abr", "size"],
+        # Prefer English when several audio tracks share the same video quality.
+        "format_sort": ["lang:en", "res", "vbr", "abr", "size"],
         "format_sort_force": True,
         "merge_output_format": "mp4",
         "outtmpl": str(output_dir / "%(id)s.%(ext)s"),
@@ -755,27 +778,47 @@ def transfer_videos(
     retry_failed: bool = False,
     channel_ids: list[int] | None = None,
     channel_id: int | None = None,
+    media_types: frozenset[str] | set[str] | list[str] | str | None = None,
 ) -> tuple[int, int, int]:
     """
     Combined pipeline: download -> upload -> delete, with limited parallelism.
 
     Only ``TRANSFER_CONCURRENCY`` videos are in-flight at once so disk usage
     stays bounded. Returns (uploaded, download_failed_or_upload_failed, skipped).
+
+    ``media_types`` limits work to videos / shorts / playlists (None = all).
     """
     channel_ids = normalize_channel_ids(channel_ids, channel_id=channel_id)
-    videos = _eligible_transfer_videos(
-        session,
-        retry_failed=retry_failed,
-        channel_ids=channel_ids,
-        max_per_channel=settings.max_videos_per_channel,
+    if isinstance(media_types, str):
+        media_types = parse_media_types(media_types)
+    elif media_types is not None:
+        media_types = frozenset(media_types)
+    do_videos = media_types is None or "videos" in media_types
+    do_shorts = media_types is None or "shorts" in media_types
+    do_playlists = media_types is None or "playlists" in media_types
+    log.info(
+        "Transfer media filter: %s",
+        "all" if media_types is None else ",".join(sorted(media_types)),
     )
-    session.commit()
 
     uploaded = 0
     failed = 0
+    videos: list[Video] = []
+    if do_videos:
+        videos = _eligible_transfer_videos(
+            session,
+            retry_failed=retry_failed,
+            channel_ids=channel_ids,
+            max_per_channel=settings.max_videos_per_channel,
+        )
+        session.commit()
+    else:
+        log.info("Skipping long-form videos (media filter)")
 
-    if not videos:
+    if do_videos and not videos:
         log.info("No videos waiting to transfer")
+    elif not videos:
+        pass
     else:
         bunny = BunnyStream(settings)
         settings.download_dir.mkdir(parents=True, exist_ok=True)
@@ -929,20 +972,30 @@ def transfer_videos(
                 if root.exists() and not any(root.iterdir()):
                     shutil.rmtree(root, ignore_errors=True)
 
-    s_up, s_fail = transfer_shorts(
-        session,
-        settings,
-        retry_failed=retry_failed,
-        channel_ids=channel_ids,
-    )
-    p_up, p_fail = transfer_playlist_items(
-        session,
-        settings,
-        retry_failed=retry_failed,
-        channel_ids=channel_ids,
-    )
-    # Playlist covers are metadata-only (no Stream file) — upload Storage thumbs here.
-    transfer_playlist_thumbnails(session, settings, channel_ids=channel_ids, force=False)
+    if do_shorts:
+        s_up, s_fail = transfer_shorts(
+            session,
+            settings,
+            retry_failed=retry_failed,
+            channel_ids=channel_ids,
+        )
+    else:
+        log.info("Skipping shorts (media filter)")
+        s_up, s_fail = 0, 0
+
+    if do_playlists:
+        p_up, p_fail = transfer_playlist_items(
+            session,
+            settings,
+            retry_failed=retry_failed,
+            channel_ids=channel_ids,
+        )
+        # Playlist covers are metadata-only (no Stream file) — upload Storage thumbs here.
+        transfer_playlist_thumbnails(session, settings, channel_ids=channel_ids, force=False)
+    else:
+        log.info("Skipping playlists (media filter)")
+        p_up, p_fail = 0, 0
+
     return uploaded + s_up + p_up, failed + s_fail + p_fail, 0
 
 

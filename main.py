@@ -20,7 +20,7 @@ from app.pipeline import (
     run_transfer,
     run_upload,
 )
-from app.utils import parse_channel_ids
+from app.utils import parse_channel_ids, parse_media_types
 
 
 def setup_logging() -> None:
@@ -66,6 +66,15 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--media",
+        type=str,
+        help=(
+            "For transfer: only these media types — videos, shorts, playlists "
+            "(comma-separated). Default: all. Examples: --media shorts "
+            "or --media videos,playlists"
+        ),
+    )
+    parser.add_argument(
         "--output-dir",
         type=Path,
         help="For export-json: folder to write creator JSON packs (default data/exports)",
@@ -96,9 +105,17 @@ def main() -> None:
 
     try:
         channel_ids = parse_channel_ids(args.channel_id)
+        media_types = parse_media_types(args.media)
     except ValueError as exc:
         print(f"error: {exc}", file=sys.stderr)
         raise SystemExit(2) from exc
+
+    if media_types is not None and args.command not in {"transfer", "run"}:
+        print(
+            "error: --media is only supported for transfer (and run)",
+            file=sys.stderr,
+        )
+        raise SystemExit(2)
 
     engine = make_engine(settings)
     init_db(engine)
@@ -111,6 +128,7 @@ def main() -> None:
             retry_failed=args.retry_failed,
             force=args.force,
             channel_ids=channel_ids,
+            media_types=media_types,
         )
         return
 
@@ -147,6 +165,7 @@ def main() -> None:
                 settings,
                 retry_failed=args.retry_failed,
                 channel_ids=channel_ids,
+                media_types=media_types,
             )
         elif args.command == "thumbnails":
             run_thumbnails(

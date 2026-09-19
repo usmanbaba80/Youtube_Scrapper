@@ -85,6 +85,44 @@ def parse_channel_ids(raw: str | None) -> list[int] | None:
     return list(dict.fromkeys(ids)) or None
 
 
+_MEDIA_ALIASES = {
+    "video": "videos",
+    "videos": "videos",
+    "short": "shorts",
+    "shorts": "shorts",
+    "playlist": "playlists",
+    "playlists": "playlists",
+    "playlist-item": "playlists",
+    "playlist-items": "playlists",
+    "playlist_items": "playlists",
+}
+ALL_MEDIA_TYPES = ("videos", "shorts", "playlists")
+
+
+def parse_media_types(raw: str | None) -> frozenset[str] | None:
+    """
+    Parse ``--media`` values: ``videos``, ``shorts``, ``playlists``,
+    or a comma list like ``videos,shorts``.
+    Returns None when unset (meaning: all media types).
+    """
+    if raw is None:
+        return None
+    text = str(raw).strip().lower()
+    if not text or text in {"all", "*"}:
+        return None
+    selected: list[str] = []
+    for part in re.split(r"[,\s]+", text):
+        if not part:
+            continue
+        key = _MEDIA_ALIASES.get(part)
+        if key is None:
+            raise ValueError(
+                f"Invalid --media value {part!r}; expected videos, shorts, and/or playlists"
+            )
+        selected.append(key)
+    return frozenset(selected) or None
+
+
 def normalize_channel_ids(
     channel_ids: list[int] | tuple[int, ...] | int | None = None,
     *,

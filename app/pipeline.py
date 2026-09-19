@@ -112,6 +112,7 @@ def run_all(
     force: bool = False,
     channel_ids: list[int] | None = None,
     channel_id: int | None = None,
+    media_types: frozenset[str] | set[str] | list[str] | str | None = None,
 ) -> None:
     from app.utils import normalize_channel_ids
 
@@ -134,6 +135,7 @@ def run_all(
             settings,
             retry_failed=retry_failed,
             channel_ids=channel_ids,
+            media_types=media_types,
         )
         session.commit()
         run_thumbnails(

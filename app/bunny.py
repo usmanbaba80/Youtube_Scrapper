@@ -248,6 +248,60 @@ class BunnyStream:
             page += 1
         return None
 
+    def get_video(self, video_id: str) -> dict:
+        response = self.session.get(self._url(f"videos/{video_id}"), timeout=60)
+        if response.status_code != 200:
+            raise RuntimeError(
+                f"Get Stream video failed ({response.status_code}): {response.text[:500]}"
+            )
+        return response.json() or {}
+
+    def delete_video(self, video_id: str) -> None:
+        """Best-effort delete of a Stream video (used to clean up failed uploads)."""
+        if not video_id:
+            return
+        try:
+            response = self.session.delete(self._url(f"videos/{video_id}"), timeout=60)
+            if response.status_code in {200, 204, 404}:
+                log.info("Deleted Stream video %s (cleanup)", video_id)
+            else:
+                log.warning(
+                    "Failed to delete Stream video %s (%s): %s",
+                    video_id,
+                    response.status_code,
+                    response.text[:300],
+                )
+        except Exception:
+            log.exception("Error deleting Stream video %s", video_id)
+
+    @staticmethod
+    def status_label(status: int | None) -> str:
+        # Bunny Stream dashboard / webhook status codes
+        labels = {
+            0: "created/queued",
+            1: "uploaded/processing",
+            2: "processing/encoding",
+            3: "finished",
+            4: "resolution finished (playable)",
+            5: "failed",
+            6: "upload failed",
+        }
+        if status is None:
+            return "unknown"
+        return labels.get(int(status), f"status={status}")
+
+    @staticmethod
+    def _video_storage_bytes(info: dict) -> int:
+        for key in ("storageSize", "StorageSize", "size", "Size"):
+            value = info.get(key)
+            if value is None:
+                continue
+            try:
+                return int(value)
+            except (TypeError, ValueError):
+                continue
+        return 0
+
     def upload_video(
         self,
         local_path: Path,
@@ -275,6 +329,10 @@ class BunnyStream:
             raise RuntimeError(f"Create Stream video returned no guid: {created}")
 
         file_size = local_path.stat().st_size
+        if file_size <= 0:
+            self.delete_video(video_id)
+            raise RuntimeError(f"Refusing to upload empty file: {local_path}")
+
         log.info(
             "Uploading %s (%.1f MB) -> Stream video %s (collection %s)",
             local_path.name,
@@ -283,22 +341,64 @@ class BunnyStream:
             collection_id,
         )
 
-        with _ProgressReader(local_path, file_size, local_path.name) as body:
-            upload = self.session.put(
-                self._url(f"videos/{video_id}"),
-                data=body,
-                headers={
-                    "Content-Type": "application/octet-stream",
-                    "Content-Length": str(file_size),
-                },
-                timeout=(60, 120),
-            )
-        if upload.status_code not in {200, 201}:
-            raise RuntimeError(
-                f"Stream upload failed ({upload.status_code}): {upload.text[:500]}"
-            )
+        try:
+            # No read timeout: large VODs can take 30–90+ minutes. The old 120s
+            # timeout aborted PUTs and left 0-byte Stream orphans in "processing".
+            with _ProgressReader(local_path, file_size, local_path.name) as body:
+                upload = self.session.put(
+                    self._url(f"videos/{video_id}"),
+                    data=body,
+                    headers={
+                        "Content-Type": "application/octet-stream",
+                        "Content-Length": str(file_size),
+                    },
+                    timeout=(60, None),
+                )
+            if upload.status_code not in {200, 201}:
+                raise RuntimeError(
+                    f"Stream upload failed ({upload.status_code}): {upload.text[:500]}"
+                )
 
-        log.info("Finished uploading %s -> %s", local_path.name, video_id)
+            # Bunny may report storageSize a few seconds after PUT returns.
+            storage = 0
+            status: int | None = None
+            last_info: dict = {}
+            for attempt in range(1, 13):
+                time.sleep(2 if attempt > 1 else 0.5)
+                last_info = self.get_video(video_id)
+                status_raw = last_info.get("status")
+                status = int(status_raw) if isinstance(status_raw, int) else None
+                storage = self._video_storage_bytes(last_info)
+                log.info(
+                    "Stream video %s check %s/12: %s storage=%s bytes",
+                    video_id,
+                    attempt,
+                    self.status_label(status),
+                    storage,
+                )
+                if status in {5, 6}:
+                    raise RuntimeError(
+                        f"Stream reported failure for {video_id}: {self.status_label(status)}"
+                    )
+                if storage > 0 or status in {2, 3, 4}:
+                    break
+            else:
+                raise RuntimeError(
+                    f"Stream video {video_id} still 0 bytes after upload "
+                    f"(status={self.status_label(status)}). "
+                    "Upload did not land; will not mark as transferred."
+                )
+        except Exception:
+            self.delete_video(video_id)
+            raise
+
+        log.info(
+            "Finished uploading %s -> %s (%s, storage=%s bytes)",
+            local_path.name,
+            video_id,
+            self.status_label(status),
+            storage,
+        )
         return {
             "video_id": video_id,
             "collection_id": collection_id,
