@@ -126,6 +126,7 @@ def run_all(
             retry_failed=retry_failed,
             force=force,
             channel_ids=channel_ids,
+            media_types=media_types,
         )
         session.commit()
         run_metadata(session, settings, retry_failed=retry_failed)

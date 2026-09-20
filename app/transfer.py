@@ -1013,6 +1013,7 @@ def transfer_shorts(
         retry_failed=retry_failed,
         channel_ids=channel_ids,
         max_per_channel=settings.max_shorts_per_channel,
+        max_duration_seconds=settings.max_short_duration_seconds,
     )
     session.commit()
     if not shorts:
@@ -1135,6 +1136,7 @@ def _eligible_transfer_shorts(
     channel_ids: list[int] | None = None,
     channel_id: int | None = None,
     max_per_channel: int,
+    max_duration_seconds: int = 180,
 ) -> list[Short]:
     statuses = ["pending", "failed", "downloaded", "downloading", "uploading"]
     if not retry_failed:
@@ -1164,6 +1166,17 @@ def _eligible_transfer_shorts(
             short.transfer_status = "uploaded"
             short.transfer_error = None
             short.local_path = None
+            continue
+
+        if (
+            short.duration_seconds is not None
+            and short.duration_seconds > max_duration_seconds
+        ):
+            short.transfer_status = "failed"
+            short.transfer_error = (
+                f"Not a YouTube Short ({short.duration_seconds}s > "
+                f"{max_duration_seconds}s max); likely mis-scraped long-form video"
+            )[:2000]
             continue
 
         local = Path(short.local_path) if short.local_path else None

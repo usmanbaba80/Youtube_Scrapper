@@ -10,7 +10,7 @@ from sqlalchemy.orm import Session, joinedload
 from app.config import Settings
 from app.models import Creator, Playlist, PlaylistItem, Short, Video
 from app.storage import BunnyStorage
-from app.utils import bunny_creator_key, normalize_channel_ids
+from app.utils import bunny_creator_key, normalize_channel_ids, parse_media_types
 
 log = logging.getLogger(__name__)
 
@@ -311,6 +311,7 @@ def transfer_thumbnails(
     *,
     channel_ids: list[int] | None = None,
     channel_id: int | None = None,
+    media_types: frozenset[str] | set[str] | list[str] | str | None = None,
     retry_failed: bool = False,
     force: bool = False,
 ) -> tuple[int, int, int]:
@@ -321,9 +322,21 @@ def transfer_thumbnails(
       - videos/shorts/playlist_items with transfer_status=uploaded
       - playlists that have a YouTube thumbnail_url (cover art)
     Skips rows that already have bunny_thumbnail_url unless force=True.
-    Use this to complete a partial set (some present, some missing).
+    ``media_types`` limits work to videos / shorts / playlists (None = all).
     """
     channel_ids = normalize_channel_ids(channel_ids, channel_id=channel_id)
+    if isinstance(media_types, str):
+        media_types = parse_media_types(media_types)
+    elif media_types is not None:
+        media_types = frozenset(media_types)
+    do_videos = media_types is None or "videos" in media_types
+    do_shorts = media_types is None or "shorts" in media_types
+    do_playlists = media_types is None or "playlists" in media_types
+    log.info(
+        "Thumbnail media filter: %s",
+        "all" if media_types is None else ",".join(sorted(media_types)),
+    )
+
     if not settings.bunny_storage_zone or not settings.bunny_storage_password:
         log.warning("Bunny Storage not configured; skipping thumbnails")
         return 0, 0, 0
@@ -337,119 +350,124 @@ def transfer_thumbnails(
             return query.filter(Creator.id.in_(channel_ids))
         return query
 
-    # Videos
-    vq = (
-        session.query(Video)
-        .options(joinedload(Video.creator))
-        .filter(Video.is_short.is_(False))
-        .filter(Video.transfer_status == "uploaded")
-        .filter(Video.thumbnail_url.isnot(None), Video.thumbnail_url != "")
-    )
-    if not force:
-        vq = vq.filter(
-            (Video.bunny_thumbnail_url.is_(None)) | (Video.bunny_thumbnail_url == "")
+    if do_videos:
+        vq = (
+            session.query(Video)
+            .options(joinedload(Video.creator))
+            .filter(Video.is_short.is_(False))
+            .filter(Video.transfer_status == "uploaded")
+            .filter(Video.thumbnail_url.isnot(None), Video.thumbnail_url != "")
         )
-    vq = _creator_filter(vq.join(Video.creator))
-    for video in vq.order_by(Video.id.asc()).all():
-        try:
-            if sync_row_thumbnail(
-                settings,
-                video.creator,
-                video,
-                kind="videos",
-                public_id=video.video_id or video.youtube_video_id,
-                force=force,
-            ):
-                uploaded += 1
-            else:
-                skipped += 1
-            session.commit()
-        except Exception as exc:
-            session.rollback()
-            failed += 1
-            log.exception("Thumbnail failed for video %s: %s", video.youtube_video_id, exc)
-
-    # Shorts
-    sq = (
-        session.query(Short)
-        .options(joinedload(Short.creator))
-        .filter(Short.transfer_status == "uploaded")
-        .filter(Short.thumbnail_url.isnot(None), Short.thumbnail_url != "")
-    )
-    if not force:
-        sq = sq.filter(
-            (Short.bunny_thumbnail_url.is_(None)) | (Short.bunny_thumbnail_url == "")
-        )
-    sq = _creator_filter(sq.join(Short.creator))
-    for short in sq.order_by(Short.id.asc()).all():
-        try:
-            if sync_row_thumbnail(
-                settings,
-                short.creator,
-                short,
-                kind="shorts",
-                public_id=short.short_id or short.youtube_video_id,
-                force=force,
-            ):
-                uploaded += 1
-            else:
-                skipped += 1
-            session.commit()
-        except Exception as exc:
-            session.rollback()
-            failed += 1
-            log.exception("Thumbnail failed for short %s: %s", short.youtube_video_id, exc)
-
-    # Playlist covers (no Stream upload — Storage only)
-    p_up, p_fail, p_skip = transfer_playlist_thumbnails(
-        session,
-        settings,
-        channel_ids=channel_ids,
-        force=force,
-    )
-    uploaded += p_up
-    failed += p_fail
-    skipped += p_skip
-
-    # Standalone playlist items (not reused from videos/shorts)
-    iq = (
-        session.query(PlaylistItem)
-        .options(joinedload(PlaylistItem.playlist).joinedload(Playlist.creator))
-        .filter(PlaylistItem.transfer_status == "uploaded")
-        .filter(PlaylistItem.reuse_source == "none")
-        .filter(PlaylistItem.thumbnail_url.isnot(None), PlaylistItem.thumbnail_url != "")
-    )
-    if not force:
-        iq = iq.filter(
-            (PlaylistItem.bunny_thumbnail_url.is_(None))
-            | (PlaylistItem.bunny_thumbnail_url == "")
-        )
-    if channel_ids is not None:
-        iq = iq.filter(PlaylistItem.creator_row_id.in_(channel_ids))
-    for item in iq.order_by(PlaylistItem.id.asc()).all():
-        creator = item.playlist.creator if item.playlist else None
-        if creator is None:
-            failed += 1
-            continue
-        try:
-            if sync_row_thumbnail(
-                settings,
-                creator,
-                item,
-                kind="playlist-items",
-                public_id=item.youtube_video_id,
-                force=force,
-            ):
-                uploaded += 1
-            else:
-                skipped += 1
-            session.commit()
-        except Exception as exc:
-            session.rollback()
-            failed += 1
-            log.exception(
-                "Thumbnail failed for playlist item %s: %s", item.youtube_video_id, exc
+        if not force:
+            vq = vq.filter(
+                (Video.bunny_thumbnail_url.is_(None)) | (Video.bunny_thumbnail_url == "")
             )
+        vq = _creator_filter(vq.join(Video.creator))
+        for video in vq.order_by(Video.id.asc()).all():
+            try:
+                if sync_row_thumbnail(
+                    settings,
+                    video.creator,
+                    video,
+                    kind="videos",
+                    public_id=video.video_id or video.youtube_video_id,
+                    force=force,
+                ):
+                    uploaded += 1
+                else:
+                    skipped += 1
+                session.commit()
+            except Exception as exc:
+                session.rollback()
+                failed += 1
+                log.exception("Thumbnail failed for video %s: %s", video.youtube_video_id, exc)
+    else:
+        log.info("Skipping video thumbnails (media filter)")
+
+    if do_shorts:
+        sq = (
+            session.query(Short)
+            .options(joinedload(Short.creator))
+            .filter(Short.transfer_status == "uploaded")
+            .filter(Short.thumbnail_url.isnot(None), Short.thumbnail_url != "")
+        )
+        if not force:
+            sq = sq.filter(
+                (Short.bunny_thumbnail_url.is_(None)) | (Short.bunny_thumbnail_url == "")
+            )
+        sq = _creator_filter(sq.join(Short.creator))
+        for short in sq.order_by(Short.id.asc()).all():
+            try:
+                if sync_row_thumbnail(
+                    settings,
+                    short.creator,
+                    short,
+                    kind="shorts",
+                    public_id=short.short_id or short.youtube_video_id,
+                    force=force,
+                ):
+                    uploaded += 1
+                else:
+                    skipped += 1
+                session.commit()
+            except Exception as exc:
+                session.rollback()
+                failed += 1
+                log.exception("Thumbnail failed for short %s: %s", short.youtube_video_id, exc)
+    else:
+        log.info("Skipping short thumbnails (media filter)")
+
+    if do_playlists:
+        p_up, p_fail, p_skip = transfer_playlist_thumbnails(
+            session,
+            settings,
+            channel_ids=channel_ids,
+            force=force,
+        )
+        uploaded += p_up
+        failed += p_fail
+        skipped += p_skip
+
+        iq = (
+            session.query(PlaylistItem)
+            .options(joinedload(PlaylistItem.playlist).joinedload(Playlist.creator))
+            .filter(PlaylistItem.transfer_status == "uploaded")
+            .filter(PlaylistItem.reuse_source == "none")
+            .filter(PlaylistItem.thumbnail_url.isnot(None), PlaylistItem.thumbnail_url != "")
+        )
+        if not force:
+            iq = iq.filter(
+                (PlaylistItem.bunny_thumbnail_url.is_(None))
+                | (PlaylistItem.bunny_thumbnail_url == "")
+            )
+        if channel_ids is not None:
+            iq = iq.filter(PlaylistItem.creator_row_id.in_(channel_ids))
+        for item in iq.order_by(PlaylistItem.id.asc()).all():
+            creator = item.playlist.creator if item.playlist else None
+            if creator is None:
+                failed += 1
+                continue
+            try:
+                if sync_row_thumbnail(
+                    settings,
+                    creator,
+                    item,
+                    kind="playlist-items",
+                    public_id=item.youtube_video_id,
+                    force=force,
+                ):
+                    uploaded += 1
+                else:
+                    skipped += 1
+                session.commit()
+            except Exception as exc:
+                session.rollback()
+                failed += 1
+                log.exception(
+                    "Thumbnail failed for playlist item %s: %s", item.youtube_video_id, exc
+                )
+    else:
+        log.info("Skipping playlist thumbnails (media filter)")
 
     log.info(
         "Thumbnails finished: %s uploaded, %s failed, %s skipped (already present)",

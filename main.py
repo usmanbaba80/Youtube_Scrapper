@@ -69,7 +69,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--media",
         type=str,
         help=(
-            "For transfer: only these media types — videos, shorts, playlists "
+            "For scrape/transfer/thumbnails: only these media types — videos, shorts, playlists "
             "(comma-separated). Default: all. Examples: --media shorts "
             "or --media videos,playlists"
         ),
@@ -110,9 +110,14 @@ def main() -> None:
         print(f"error: {exc}", file=sys.stderr)
         raise SystemExit(2) from exc
 
-    if media_types is not None and args.command not in {"transfer", "run"}:
+    if media_types is not None and args.command not in {
+        "scrape",
+        "transfer",
+        "thumbnails",
+        "run",
+    }:
         print(
-            "error: --media is only supported for transfer (and run)",
+            "error: --media is only supported for scrape, transfer, thumbnails, and run",
             file=sys.stderr,
         )
         raise SystemExit(2)
@@ -142,6 +147,7 @@ def main() -> None:
                 retry_failed=args.retry_failed,
                 force=args.force,
                 channel_ids=channel_ids,
+                media_types=media_types,
             )
         elif args.command == "metadata":
             run_metadata(session, settings, retry_failed=args.retry_failed)
@@ -172,6 +178,7 @@ def main() -> None:
                 session,
                 settings,
                 channel_ids=channel_ids,
+                media_types=media_types,
                 retry_failed=args.retry_failed,
                 force=args.force,
             )

@@ -77,6 +77,7 @@ class Settings:
     download_dir: Path
     max_videos_per_channel: int
     max_shorts_per_channel: int
+    max_short_duration_seconds: int
     max_playlists_per_channel: int
     max_playlist_items: int
     scrape_fetch_limit: int
@@ -105,6 +106,8 @@ def load_settings() -> Settings:
     max_shorts = _env_int("MAX_SHORTS_PER_CHANNEL", 50)
     max_playlists = _env_int("MAX_PLAYLISTS_PER_CHANNEL", 10)
     max_playlist_items = _env_int("MAX_PLAYLIST_ITEMS", 100)
+    # YouTube Shorts max length is 3 minutes; longer = mis-scraped long-form.
+    max_short_duration = _env_int("MAX_SHORT_DURATION_SECONDS", 180)
     return Settings(
         youtube_api_key=_env("YOUTUBE_API_KEY"),
         bunny_stream_library_id=_env("BUNNY_STREAM_LIBRARY_ID"),
@@ -125,6 +128,7 @@ def load_settings() -> Settings:
         download_dir=download_dir,
         max_videos_per_channel=max_videos,
         max_shorts_per_channel=max(0, min(max_shorts, 999)),
+        max_short_duration_seconds=max(15, min(max_short_duration, 600)),
         max_playlists_per_channel=max(0, min(max_playlists, 99)),
         max_playlist_items=max(1, min(max_playlist_items, 500)),
         scrape_fetch_limit=max(max_videos + 80, 180),

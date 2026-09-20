@@ -9,7 +9,11 @@ from sqlalchemy.orm import Session
 from app.config import Settings
 from app.models import Creator, Playlist, PlaylistItem, Short, Video
 from app.playlists import fetch_channel_playlists, fetch_playlist_items
-from app.popular import fetch_channel_shorts, fetch_popular_videos
+from app.popular import (
+    detect_channel_tabs_and_id,
+    fetch_channel_shorts,
+    fetch_popular_videos,
+)
 from app.utils import (
     normalize_channel_ids,
     build_playlist_id,
@@ -109,6 +113,44 @@ def _store_popular_videos(
         inserted += 1
     session.flush()
     return inserted, removed
+
+
+def _purge_all_creator_shorts(session: Session, creator: Creator) -> int:
+    """
+    Delete every Short row for this creator (including uploaded/downloaded).
+
+    Used when the channel has no Shorts tab — prior scrapes may have stored
+    long-form videos as fake shorts. Unlinks playlist_items that pointed at them.
+    Does not delete files already on Bunny Stream.
+    """
+    shorts = (
+        session.query(Short).filter(Short.creator_row_id == creator.id).all()
+    )
+    if not shorts:
+        return 0
+    short_ids = [s.id for s in shorts]
+    for item in (
+        session.query(PlaylistItem)
+        .filter(PlaylistItem.short_row_id.in_(short_ids))
+        .all()
+    ):
+        item.short_row_id = None
+        if item.reuse_source == "short":
+            item.reuse_source = "none"
+            if item.transfer_status == "skipped":
+                item.transfer_status = "pending"
+    removed = 0
+    for short in shorts:
+        log.warning(
+            "Purging short %s (status=%s) — channel has no Shorts tab: %s",
+            short.youtube_video_id,
+            short.transfer_status,
+            (short.title or "")[:80],
+        )
+        session.delete(short)
+        removed += 1
+    session.flush()
+    return removed
 
 
 def _store_shorts(
@@ -374,8 +416,23 @@ def scrape_all_creators(
     force: bool = False,
     channel_ids: list[int] | None = None,
     channel_id: int | None = None,
+    media_types: frozenset[str] | set[str] | list[str] | str | None = None,
 ) -> tuple[int, int]:
+    from app.utils import parse_media_types
+
     channel_ids = normalize_channel_ids(channel_ids, channel_id=channel_id)
+    if isinstance(media_types, str):
+        media_types = parse_media_types(media_types)
+    elif media_types is not None:
+        media_types = frozenset(media_types)
+    want_videos = media_types is None or "videos" in media_types
+    want_shorts = media_types is None or "shorts" in media_types
+    want_playlists = media_types is None or "playlists" in media_types
+    log.info(
+        "Scrape media filter: %s",
+        "all" if media_types is None else ",".join(sorted(media_types)),
+    )
+
     query = session.query(Creator)
     if channel_ids is not None:
         query = query.filter(Creator.id.in_(channel_ids))
@@ -402,34 +459,55 @@ def scrape_all_creators(
                 failed += 1
                 continue
 
-            items = scrape_creator_popular_videos(settings, creator)
-            if not items:
-                raise RuntimeError("No long-form Popular videos found")
+            tabs, yt_channel_id, tab_handle = detect_channel_tabs_and_id(creator.channel_url)
+            if yt_channel_id:
+                creator.youtube_channel_id = creator.youtube_channel_id or yt_channel_id
+            if tab_handle:
+                creator.handle = creator.handle or tab_handle
+            log.info(
+                "Scraping %s with tabs=%s",
+                creator_label,
+                ",".join(sorted(tabs)) or "(none)",
+            )
 
-            first = items[0]
-            if first.get("youtube_channel_id"):
-                creator.youtube_channel_id = first["youtube_channel_id"]
-            handle = first.get("handle") or channel_handle(creator.channel_url)
-            if handle:
-                creator.handle = handle
+            # --- Videos ---
+            items: list[dict] = []
+            v_ins = v_rem = 0
+            if want_videos and "videos" in tabs:
+                items = scrape_creator_popular_videos(settings, creator)
+                if not items:
+                    log.warning(
+                        "Videos tab present for %s but Popular/Videos listing was empty",
+                        creator_label,
+                    )
+                else:
+                    first = items[0]
+                    if first.get("youtube_channel_id"):
+                        creator.youtube_channel_id = first["youtube_channel_id"]
+                    handle = first.get("handle") or channel_handle(creator.channel_url)
+                    if handle:
+                        creator.handle = handle
+                    v_ins, v_rem = _store_popular_videos(session, creator, items)
+                    session.commit()
+                    creator = session.get(Creator, creator_pk)
+            elif want_videos:
+                log.info("Skipping videos for %s — no Videos tab on channel", creator_label)
+            else:
+                log.info("Skipping videos for %s — media filter", creator_label)
 
-            v_ins, v_rem = _store_popular_videos(session, creator, items)
-            # Persist videos before shorts/playlists so a later failure does not
-            # leave the session in PendingRollback and wipe video updates.
-            session.commit()
-            creator = session.get(Creator, creator_pk)
             if creator is None:
                 failed += 1
                 continue
 
-            # Shorts
+            # --- Shorts ---
             s_ins = s_rem = 0
             shorts_count = 0
-            if settings.max_shorts_per_channel > 0:
+            if want_shorts and settings.max_shorts_per_channel > 0 and "shorts" in tabs:
                 try:
                     short_items = fetch_channel_shorts(
                         creator.channel_url,
                         limit=settings.max_shorts_per_channel,
+                        tabs=tabs,
                     )
                     shorts_count = len(short_items)
                     s_ins, s_rem = _store_shorts(session, creator, short_items)
@@ -447,14 +525,35 @@ def scrape_all_creators(
                         "Shorts scrape failed for %s (continuing)",
                         creator_label,
                     )
+            elif want_shorts and settings.max_shorts_per_channel > 0:
+                log.info(
+                    "No Shorts tab for %s — deleting all rows in shorts table "
+                    "(including uploaded/downloaded)",
+                    creator_label,
+                )
+                try:
+                    s_rem = _purge_all_creator_shorts(session, creator)
+                    session.commit()
+                    creator = session.get(Creator, creator_pk)
+                except Exception:
+                    session.rollback()
+                    creator = session.get(Creator, creator_pk)
+                    log.exception(
+                        "Failed purging shorts for %s (continuing)",
+                        creator_label,
+                    )
+            elif want_shorts:
+                log.info("Skipping shorts for %s — MAX_SHORTS_PER_CHANNEL=0", creator_label)
+            else:
+                log.info("Skipping shorts for %s — media filter", creator_label)
 
             if creator is None:
                 failed += 1
                 continue
 
-            # Playlists + items (reuse videos/shorts when possible)
+            # --- Playlists ---
             p_up = linked = unlinked = 0
-            if settings.max_playlists_per_channel > 0:
+            if want_playlists and settings.max_playlists_per_channel > 0 and "playlists" in tabs:
                 if not settings.youtube_api_key:
                     log.warning(
                         "Skipping playlists for %s — YOUTUBE_API_KEY missing",
@@ -484,22 +583,40 @@ def scrape_all_creators(
                             "Playlist scrape failed for %s (continuing)",
                             creator_label,
                         )
+            elif want_playlists and settings.max_playlists_per_channel > 0:
+                log.info(
+                    "Skipping playlists for %s — no Playlists tab on channel",
+                    creator_label,
+                )
+            elif want_playlists:
+                log.info(
+                    "Skipping playlists for %s — MAX_PLAYLISTS_PER_CHANNEL=0",
+                    creator_label,
+                )
+            else:
+                log.info("Skipping playlists for %s — media filter", creator_label)
 
             if creator is None:
                 failed += 1
                 continue
+
+            if media_types is None and not items and shorts_count == 0 and p_up == 0:
+                raise RuntimeError(
+                    "Nothing scraped: channel has no usable Videos/Shorts/Playlists content"
+                )
 
             creator.scrape_status = "done"
             creator.scraped_at = utcnow()
             session.commit()
             scraped += 1
             log.info(
-                "[%s/%s] %s (creator_id=%s): videos=%s (+%s/-%s), shorts=%s (+%s/-%s), "
+                "[%s/%s] %s (creator_id=%s): tabs=%s; videos=%s (+%s/-%s), shorts=%s (+%s/-%s), "
                 "playlists=%s (items linked=%s, unlinked=%s)",
                 index,
                 len(creators),
                 creator_label,
                 creator.creator_id,
+                ",".join(sorted(tabs)) or "-",
                 len(items),
                 v_ins,
                 v_rem,
@@ -524,6 +641,7 @@ def scrape_all_creators(
             time.sleep(settings.scrape_delay_seconds)
 
     return scraped, failed
+
 
 
 # Backward-compatible alias

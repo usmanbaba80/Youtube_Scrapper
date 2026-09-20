@@ -179,6 +179,51 @@ def _fetch_playlists_metadata(api_key: str, playlist_ids: list[str]) -> dict[str
     return results
 
 
+def _purge_oversized_shorts(session: Session, settings: Settings) -> int:
+    """
+    Delete Short rows that are actually long-form VODs.
+
+    Scrape walks every videoId in the channel /shorts Innertube payload and
+    stamps them as https://youtube.com/shorts/{id}. That URL works for any
+    video id (it redirects to /watch), so channels with no Shorts tab can still
+    produce 30–60 minute "shorts".
+    """
+    limit = settings.max_short_duration_seconds
+    fakes = (
+        session.query(Short)
+        .filter(
+            Short.duration_seconds.isnot(None),
+            Short.duration_seconds > limit,
+        )
+        .all()
+    )
+    removed = 0
+    for short in fakes:
+        log.warning(
+            "Dropping fake short %s (%ss > max %ss): %s",
+            short.youtube_video_id,
+            short.duration_seconds,
+            limit,
+            (short.title or "")[:80],
+        )
+        # Unlink playlist items that pointed at this fake short.
+        for item in (
+            session.query(PlaylistItem)
+            .filter(PlaylistItem.short_row_id == short.id)
+            .all()
+        ):
+            item.short_row_id = None
+            if item.reuse_source == "short":
+                item.reuse_source = "none"
+                if item.transfer_status == "skipped":
+                    item.transfer_status = "pending"
+        session.delete(short)
+        removed += 1
+    if removed:
+        session.flush()
+    return removed
+
+
 def fetch_all_metadata(
     session: Session,
     settings: Settings,
@@ -243,6 +288,16 @@ def fetch_all_metadata(
             updated += 1
     else:
         log.info("No shorts waiting for metadata")
+
+    # Drop fake "shorts": channels without a Shorts tab can still return long-form
+    # videoIds from /shorts browse JSON; /shorts/{id} then redirects to watch.
+    removed_fake = _purge_oversized_shorts(session, settings)
+    if removed_fake:
+        log.info(
+            "Removed %s fake shorts longer than %ss (not real YouTube Shorts)",
+            removed_fake,
+            settings.max_short_duration_seconds,
+        )
 
     # --- Playlists (only if still pending; scrape often already filled them) ---
     playlists = (

@@ -65,6 +65,105 @@ def _shorts_page_url(channel_url: str) -> str:
     return _tab_page_url(channel_url, "shorts")
 
 
+_TAB_TITLE_MAP = {
+    "home": "home",
+    "videos": "videos",
+    "shorts": "shorts",
+    "playlists": "playlists",
+    "live": "live",
+    "streams": "live",
+    "podcasts": "podcasts",
+    "releases": "releases",
+    "community": "community",
+    "store": "store",
+    "about": "about",
+}
+
+
+def _extract_channel_tabs_from_html(html: str) -> set[str]:
+    """
+    Detect which channel nav tabs exist from the channel home HTML.
+
+    Prefers tabRenderer blocks (actual channel tabs). Falls back to tab URL
+    paths like /@handle/shorts that appear in the tab strip.
+    """
+    tabs: set[str] = set()
+
+    for match in re.finditer(r'"tabRenderer"\s*:\s*\{', html):
+        block = html[match.end() : match.end() + 2500]
+        title = None
+        title_m = re.search(r'"title"\s*:\s*"([^"]+)"', block)
+        if title_m:
+            title = title_m.group(1)
+        else:
+            simple_m = re.search(r'"simpleText"\s*:\s*"([^"]+)"', block)
+            if simple_m:
+                title = simple_m.group(1)
+        if title:
+            key = _TAB_TITLE_MAP.get(title.strip().lower())
+            if key:
+                tabs.add(key)
+        url_m = re.search(
+            r'"url"\s*:\s*"(?:https://www\.youtube\.com)?/[^"]*/(videos|shorts|playlists|streams)(?:[?/"]|$)',
+            block,
+            re.I,
+        )
+        if url_m:
+            path_tab = url_m.group(1).lower()
+            tabs.add(_TAB_TITLE_MAP.get(path_tab, path_tab))
+
+    if not tabs:
+        for path_tab in ("videos", "shorts", "playlists", "streams"):
+            if re.search(
+                rf'"url"\s*:\s*"(?:https://www\.youtube\.com)?/(?:@[^"]+|channel/UC[^"]+)/{path_tab}"',
+                html,
+                re.I,
+            ):
+                tabs.add(_TAB_TITLE_MAP.get(path_tab, path_tab))
+
+    return tabs
+
+
+def detect_channel_tabs(channel_url: str) -> frozenset[str]:
+    """
+    Return available channel tabs, e.g. frozenset({'videos','playlists'}).
+
+    Used to skip Videos/Shorts/Playlists scrape when that tab is missing.
+    """
+    root = normalize_channel_url(channel_url)
+    http = _session()
+    response = http.get(root, timeout=45)
+    response.raise_for_status()
+    tabs = _extract_channel_tabs_from_html(response.text)
+    log.info(
+        "Detected channel tabs for %s: %s",
+        root,
+        ",".join(sorted(tabs)) or "(none)",
+    )
+    return frozenset(tabs)
+
+
+def detect_channel_tabs_and_id(
+    channel_url: str,
+) -> tuple[frozenset[str], str | None, str | None]:
+    """Like detect_channel_tabs, also returns (youtube_channel_id, handle)."""
+    root = normalize_channel_url(channel_url)
+    http = _session()
+    response = http.get(root, timeout=45)
+    response.raise_for_status()
+    html = response.text
+    tabs = _extract_channel_tabs_from_html(html)
+    channel_id = _extract_channel_id(html)
+    handle = _extract_handle(html, channel_url)
+    log.info(
+        "Detected channel tabs for %s: %s (channel_id=%s)",
+        root,
+        ",".join(sorted(tabs)) or "(none)",
+        channel_id or "?",
+    )
+    return frozenset(tabs), channel_id, handle
+
+
 def _session() -> requests.Session:
     session = requests.Session()
     session.headers.update(
@@ -443,15 +542,36 @@ def fetch_popular_videos(channel_url: str, limit: int = 100) -> list[dict]:
     return videos
 
 
-def fetch_channel_shorts(channel_url: str, limit: int = 50) -> list[dict]:
+def fetch_channel_shorts(
+    channel_url: str,
+    limit: int = 50,
+    *,
+    tabs: frozenset[str] | None = None,
+) -> list[dict]:
     """Fetch Shorts from the channel Shorts tab via Innertube browse."""
     if limit <= 0:
+        return []
+
+    available = tabs if tabs is not None else detect_channel_tabs(channel_url)
+    if "shorts" not in available:
+        log.info(
+            "Skipping Shorts scrape for %s — no Shorts tab on channel",
+            normalize_channel_url(channel_url),
+        )
         return []
 
     page_url = _shorts_page_url(channel_url)
     http = _session()
     response = http.get(page_url, timeout=45)
     response.raise_for_status()
+    # If YouTube redirected away from /shorts, treat as no Shorts tab.
+    if "/shorts" not in (response.url or "").lower():
+        log.info(
+            "Skipping Shorts scrape for %s — /shorts redirected to %s",
+            page_url,
+            response.url,
+        )
+        return []
     html = response.text
 
     api_key, context, headers, channel_id, handle = _innertube_context_from_html(
