@@ -82,14 +82,19 @@ class Settings:
     max_playlist_items: int
     scrape_fetch_limit: int
     cookies_file: Path | None
+    cookies_dir: Path | None
     cookies_from_browser: str | None
     ytdlp_format: str
     ytdlp_max_height: int
     ytdlp_js_runtimes: str
+    ytdlp_sleep_interval: float
+    ytdlp_sleep_requests: float
     ffmpeg_location: str
     scrape_delay_seconds: float
     download_delay_seconds: float
     download_retries: int
+    rate_limit_cooldown_seconds: float
+    rate_limit_max_cooldowns: int
     logs_dir: Path
 
 
@@ -133,14 +138,25 @@ def load_settings() -> Settings:
         max_playlist_items=max(1, min(max_playlist_items, 500)),
         scrape_fetch_limit=max(max_videos + 80, 180),
         cookies_file=_optional_path("YTDLP_COOKIES"),
+        cookies_dir=_optional_path("YTDLP_COOKIES_DIR"),
         cookies_from_browser=_env("YTDLP_COOKIES_FROM_BROWSER") or None,
         # Prefer highest available video+audio (VP9/AV1 ok); ffmpeg remuxes to mp4.
         ytdlp_format=_env("YTDLP_FORMAT", "bv*+ba/b"),
         ytdlp_max_height=_env_height("YTDLP_MAX_HEIGHT", 1080),
         ytdlp_js_runtimes=_env("YTDLP_JS_RUNTIMES"),
+        # yt-dlp built-in pauses (seconds). Cuts account-level rate limits.
+        ytdlp_sleep_interval=float(_env("YTDLP_SLEEP_INTERVAL") or "5"),
+        ytdlp_sleep_requests=float(_env("YTDLP_SLEEP_REQUESTS") or "1.5"),
         ffmpeg_location=_env("FFMPEG_LOCATION"),
         scrape_delay_seconds=float(_env("SCRAPE_DELAY_SECONDS") or "2"),
-        download_delay_seconds=float(_env("DOWNLOAD_DELAY_SECONDS") or "3"),
+        # Gap between finished downloads (serialized). Raise if you still get limited.
+        download_delay_seconds=float(_env("DOWNLOAD_DELAY_SECONDS") or "8"),
         download_retries=_env_int("DOWNLOAD_RETRIES", 3),
+        # YouTube says account limit can last up to ~1 hour.
+        rate_limit_cooldown_seconds=float(
+            _env("RATE_LIMIT_COOLDOWN_SECONDS") or "3700"
+        ),
+        # How many cooldown+cookie-rotate cycles before aborting the run.
+        rate_limit_max_cooldowns=max(1, _env_int("RATE_LIMIT_MAX_COOLDOWNS", 3)),
         logs_dir=PROJECT_ROOT / "logs",
     )

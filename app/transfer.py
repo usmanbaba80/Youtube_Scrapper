@@ -32,6 +32,11 @@ from app.utils import (
     parse_media_types,
     utcnow,
 )
+from app.ytdlp_guard import (
+    DOWNLOAD_GUARD,
+    RateLimitAbort,
+    is_youtube_rate_limited,
+)
 
 log = logging.getLogger(__name__)
 
@@ -147,7 +152,12 @@ def _prefer_english_audio() -> str:
     )
 
 
-def _ytdlp_download_opts(settings: Settings, output_dir: Path) -> dict:
+def _ytdlp_download_opts(
+    settings: Settings,
+    output_dir: Path,
+    *,
+    cookiefile: Path | None = None,
+) -> dict:
     js_runtimes = _resolve_js_runtimes(settings)
     ffmpeg_location = _resolve_ffmpeg_location(settings)
     if not js_runtimes:
@@ -174,6 +184,19 @@ def _ytdlp_download_opts(settings: Settings, output_dir: Path) -> dict:
             f"bv*[height<=?{max_h}]+({audio})/"
             f"bv*+({audio})/b"
         )
+
+    use_cookies = bool(
+        cookiefile or settings.cookies_file or settings.cookies_from_browser
+    )
+    # Fewer player clients = fewer API hits per video (major rate-limit cause).
+    player_clients = (
+        ["tv", "web"]
+        if use_cookies
+        else ["android_vr", "tv", "web_safari", "web"]
+    )
+
+    sleep_dl = max(0.0, float(settings.ytdlp_sleep_interval))
+    sleep_req = max(0.0, float(settings.ytdlp_sleep_requests))
 
     opts: dict = {
         "format": format_selector,
@@ -203,27 +226,13 @@ def _ytdlp_download_opts(settings: Settings, output_dir: Path) -> dict:
         # Never follow endless live HLS.
         "match_filter": _reject_live_or_premiere,
         "wait_for_video": None,
+        # yt-dlp recommended sleeps to avoid account rate limits.
+        "sleep_interval": sleep_dl,
+        "max_sleep_interval": max(sleep_dl, sleep_dl * 2) if sleep_dl else 0,
+        "sleep_interval_requests": sleep_req,
         "extractor_args": {
             "youtube": {
-                # Clients must match cookie mode: with cookies, android_vr/tv_simply
-                # are skipped and downloads fall back poorly.
-                "player_client": (
-                    [
-                        "tv",
-                        "tv_downgraded",
-                        "web_safari",
-                        "mweb",
-                        "web",
-                    ]
-                    if (settings.cookies_file or settings.cookies_from_browser)
-                    else [
-                        "android_vr",
-                        "tv",
-                        "tv_simply",
-                        "web_safari",
-                        "web",
-                    ]
-                ),
+                "player_client": player_clients,
             }
         },
     }
@@ -231,7 +240,9 @@ def _ytdlp_download_opts(settings: Settings, output_dir: Path) -> dict:
         opts["js_runtimes"] = js_runtimes
     if ffmpeg_location:
         opts["ffmpeg_location"] = ffmpeg_location
-    if settings.cookies_file:
+    if cookiefile is not None:
+        opts["cookiefile"] = str(cookiefile)
+    elif settings.cookies_file:
         opts["cookiefile"] = str(settings.cookies_file)
     elif settings.cookies_from_browser:
         opts["cookiesfrombrowser"] = (settings.cookies_from_browser,)
@@ -240,91 +251,119 @@ def _ytdlp_download_opts(settings: Settings, output_dir: Path) -> dict:
 
 def download_video(settings: Settings, video: Video, output_dir: Path) -> Path:
     output_dir.mkdir(parents=True, exist_ok=True)
-    opts = _ytdlp_download_opts(settings, output_dir)
+    DOWNLOAD_GUARD.configure(settings)
     attempts = max(1, settings.download_retries)
     last_error: Exception | None = None
 
     log.info("Downloading %s (%s)", video.youtube_video_id, video.title or video.url)
-    for attempt in range(1, attempts + 1):
+
+    while True:
+        DOWNLOAD_GUARD.raise_if_aborted()
+        cookiefile = DOWNLOAD_GUARD.acquire(settings)
+        released = False
         try:
-            with YoutubeDL(opts) as ydl:
-                # Probe first so live streams fail fast (before ffmpeg HLS loop).
-                meta = ydl.extract_info(video.url, download=False)
-                if not meta:
-                    raise RuntimeError("yt-dlp returned no metadata")
-                reject = _reject_live_or_premiere(meta)
-                if reject:
-                    raise RuntimeError(reject)
-
-                info = ydl.extract_info(video.url, download=True)
-                if not info:
-                    raise RuntimeError("yt-dlp returned no info after download")
-
-                height = info.get("height")
-                if not height and info.get("requested_formats"):
-                    height = max(
-                        (fmt.get("height") or 0 for fmt in info["requested_formats"]),
-                        default=0,
-                    ) or None
-                log.info(
-                    "Selected format %s (%s) for %s",
-                    info.get("format_id") or "unknown",
-                    f"{height}p" if height else (info.get("resolution") or "unknown"),
-                    video.youtube_video_id,
-                )
-                if height and height < 720:
+            opts = _ytdlp_download_opts(settings, output_dir, cookiefile=cookiefile)
+            rate_limited = False
+            for attempt in range(1, attempts + 1):
+                try:
+                    filepath = _ytdlp_fetch_file(opts, video, output_dir)
+                    DOWNLOAD_GUARD.release(ok=True)
+                    released = True
+                    return filepath
+                except Exception as exc:
+                    last_error = exc
+                    if is_youtube_rate_limited(exc):
+                        rate_limited = True
+                        break
+                    message = str(exc).lower()
+                    retryable = any(
+                        token in message
+                        for token in (
+                            "403",
+                            "forbidden",
+                            "timed out",
+                            "timeout",
+                        )
+                    )
+                    if attempt >= attempts or not retryable:
+                        raise
+                    sleep_for = min(2 ** attempt, 45)
                     log.warning(
-                        "Low resolution %sp for %s — source may not offer HD, "
-                        "or YouTube blocked higher formats",
-                        height,
+                        "Download attempt %s/%s failed for %s (%s). Retrying in %ss...",
+                        attempt,
+                        attempts,
                         video.youtube_video_id,
+                        exc,
+                        sleep_for,
                     )
+                    time.sleep(sleep_for)
 
-                requested = info.get("requested_downloads") or []
-                filepath = None
-                if requested and requested[0].get("filepath"):
-                    filepath = Path(requested[0]["filepath"])
-                if filepath is None:
-                    filename = ydl.prepare_filename(info)
-                    filepath = Path(filename)
-                    if not filepath.exists():
-                        alt = filepath.with_suffix(".mp4")
-                        if alt.exists():
-                            filepath = alt
-            if not filepath.exists():
-                matches = list(output_dir.glob(f"{video.youtube_video_id}.*"))
-                matches = [
-                    path
-                    for path in matches
-                    if path.suffix.lower() not in {".part", ".ytdl", ".json"}
-                ]
-                if not matches:
-                    raise RuntimeError(
-                        f"Downloaded file not found for {video.youtube_video_id}"
-                    )
-                filepath = matches[0]
-            return filepath
-        except Exception as exc:
-            last_error = exc
-            message = str(exc).lower()
-            retryable = any(
-                token in message
-                for token in ("403", "forbidden", "http error 429", "timed out", "timeout")
-            )
-            if attempt >= attempts or not retryable:
-                raise
-            sleep_for = min(2 ** attempt, 45)
+            if rate_limited:
+                DOWNLOAD_GUARD.release(ok=False)
+                released = True
+                DOWNLOAD_GUARD.trip_rate_limit(
+                    settings, video_id=video.youtube_video_id
+                )
+                continue
+            raise RuntimeError(str(last_error) if last_error else "Download failed")
+        finally:
+            if not released:
+                DOWNLOAD_GUARD.release(ok=False)
+
+def _ytdlp_fetch_file(opts: dict, video: Video, output_dir: Path) -> Path:
+    """Run one yt-dlp download and return the local file path."""
+    with YoutubeDL(opts) as ydl:
+        # Single extract+download (match_filter rejects live).
+        # A separate probe doubled YouTube API hits and worsened rate limits.
+        info = ydl.extract_info(video.url, download=True)
+        if not info:
+            raise RuntimeError("yt-dlp returned no info after download")
+
+        height = info.get("height")
+        if not height and info.get("requested_formats"):
+            height = max(
+                (fmt.get("height") or 0 for fmt in info["requested_formats"]),
+                default=0,
+            ) or None
+        log.info(
+            "Selected format %s (%s) for %s",
+            info.get("format_id") or "unknown",
+            f"{height}p" if height else (info.get("resolution") or "unknown"),
+            video.youtube_video_id,
+        )
+        if height and height < 720:
             log.warning(
-                "Download attempt %s/%s failed for %s (%s). Retrying in %ss...",
-                attempt,
-                attempts,
+                "Low resolution %sp for %s — source may not offer HD, "
+                "or YouTube blocked higher formats",
+                height,
                 video.youtube_video_id,
-                exc,
-                sleep_for,
             )
-            time.sleep(sleep_for)
 
-    raise RuntimeError(str(last_error) if last_error else "Download failed")
+        requested = info.get("requested_downloads") or []
+        filepath = None
+        if requested and requested[0].get("filepath"):
+            filepath = Path(requested[0]["filepath"])
+        if filepath is None:
+            filename = ydl.prepare_filename(info)
+            filepath = Path(filename)
+            if not filepath.exists():
+                alt = filepath.with_suffix(".mp4")
+                if alt.exists():
+                    filepath = alt
+
+    if not filepath.exists():
+        matches = list(output_dir.glob(f"{video.youtube_video_id}.*"))
+        matches = [
+            path
+            for path in matches
+            if path.suffix.lower() not in {".part", ".ytdl", ".json"}
+        ]
+        if not matches:
+            raise RuntimeError(
+                f"Downloaded file not found for {video.youtube_video_id}"
+            )
+        filepath = matches[0]
+    return filepath
 
 
 def _eligible_download_videos(
@@ -416,6 +455,8 @@ def download_videos(
     channel_ids: list[int] | None = None,
     channel_id: int | None = None,
 ) -> tuple[int, int]:
+    DOWNLOAD_GUARD.reset_run()
+    DOWNLOAD_GUARD.configure(settings)
     channel_ids = normalize_channel_ids(channel_ids, channel_id=channel_id)
     videos = _eligible_download_videos(
         session,
@@ -436,6 +477,8 @@ def download_videos(
     settings.download_dir.mkdir(parents=True, exist_ok=True)
 
     for creator_index, (_cid, creator_videos) in enumerate(by_creator.items(), start=1):
+        if DOWNLOAD_GUARD.is_aborted():
+            break
         creator = creator_videos[0].creator
         folder = creator_dir(settings, creator, FOLDER_VIDEOS)
         folder.mkdir(parents=True, exist_ok=True)
@@ -465,7 +508,23 @@ def download_videos(
                     len(creator_videos),
                     local_path.name,
                 )
+            except RateLimitAbort as exc:
+                _reset_job_to_pending(video, reason=str(exc))
+                session.commit()
+                log.error(
+                    "Download run paused after YouTube rate-limit on %s",
+                    video.youtube_video_id,
+                )
+                return downloaded, failed
             except Exception as exc:
+                if is_youtube_rate_limited(exc):
+                    _reset_job_to_pending(video, reason=str(exc))
+                    session.commit()
+                    log.error(
+                        "Download run paused after YouTube rate-limit on %s",
+                        video.youtube_video_id,
+                    )
+                    return downloaded, failed
                 video.transfer_status = "failed"
                 video.transfer_error = str(exc)[:2000]
                 video.local_path = None
@@ -473,8 +532,9 @@ def download_videos(
                 failed += 1
                 log.exception("Failed download for %s", video.youtube_video_id)
 
+            # Delay is also enforced inside DOWNLOAD_GUARD; keep a small gap here as backup.
             if index < len(creator_videos) and settings.download_delay_seconds > 0:
-                time.sleep(settings.download_delay_seconds)
+                time.sleep(min(1.0, settings.download_delay_seconds))
 
     return downloaded, failed
 
@@ -740,6 +800,7 @@ def _run_transfer_job(settings: Settings, job: _TransferJob) -> dict:
     local_path = job.existing_local
     try:
         if local_path is None or not local_path.exists():
+            DOWNLOAD_GUARD.raise_if_aborted()
             job.output_dir.mkdir(parents=True, exist_ok=True)
             target = _DownloadTarget(job.youtube_video_id, job.url, job.title)
             local_path = download_video(settings, target, job.output_dir)
@@ -758,17 +819,62 @@ def _run_transfer_job(settings: Settings, job: _TransferJob) -> dict:
             "bunny": result,
             "file_size": file_size,
         }
-    except Exception as exc:
+    except RateLimitAbort as exc:
         kept = None
         if local_path is not None and local_path.exists():
             kept = str(local_path.resolve())
         return {
             "ok": False,
+            "rate_limit_abort": True,
             "db_id": job.db_id,
             "youtube_video_id": job.youtube_video_id,
             "error": str(exc)[:2000],
             "local_path": kept,
         }
+    except Exception as exc:
+        kept = None
+        if local_path is not None and local_path.exists():
+            kept = str(local_path.resolve())
+        rate_limited = is_youtube_rate_limited(exc)
+        return {
+            "ok": False,
+            "rate_limit_abort": rate_limited,
+            "db_id": job.db_id,
+            "youtube_video_id": job.youtube_video_id,
+            "error": str(exc)[:2000],
+            "local_path": kept,
+        }
+
+
+def _reset_job_to_pending(row, *, reason: str) -> None:
+    """Leave work for a later run instead of marking failed after rate-limit abort."""
+    row.transfer_status = "pending"
+    row.transfer_error = reason[:2000]
+
+
+def _cancel_remaining_transfer_jobs(
+    session: Session,
+    futures: dict,
+    *,
+    model,
+    reason: str,
+) -> None:
+    """Cancel queued futures and reset unfinished rows to pending."""
+    for future, job in futures.items():
+        future.cancel()
+        if future.done() and not future.cancelled():
+            continue
+        row = session.get(model, job.db_id)
+        if row is not None and row.transfer_status in {
+            "downloading",
+            "uploading",
+        }:
+            _reset_job_to_pending(row, reason=reason)
+    try:
+        session.commit()
+    except Exception:
+        session.rollback()
+        log.exception("Failed to reset pending jobs after rate-limit abort")
 
 
 def transfer_videos(
@@ -788,6 +894,8 @@ def transfer_videos(
 
     ``media_types`` limits work to videos / shorts / playlists (None = all).
     """
+    DOWNLOAD_GUARD.reset_run()
+    DOWNLOAD_GUARD.configure(settings)
     channel_ids = normalize_channel_ids(channel_ids, channel_id=channel_id)
     if isinstance(media_types, str):
         media_types = parse_media_types(media_types)
@@ -888,6 +996,10 @@ def transfer_videos(
             )
 
             video_by_id = {v.id: v for v in videos}
+            abort_reason = (
+                "Paused: YouTube rate-limit. Re-run with --retry-failed after cooldown "
+                "or after rotating cookies in YTDLP_COOKIES_DIR."
+            )
 
             with ThreadPoolExecutor(max_workers=workers) as pool:
                 futures = {
@@ -898,11 +1010,25 @@ def transfer_videos(
                     try:
                         result = future.result()
                     except Exception as exc:
-                        failed += 1
                         video = session.get(Video, job.db_id) or video_by_id.get(job.db_id)
                         if video is not None:
+                            if isinstance(exc, RateLimitAbort) or is_youtube_rate_limited(exc):
+                                _reset_job_to_pending(video, reason=str(exc))
+                                try:
+                                    session.commit()
+                                except Exception:
+                                    session.rollback()
+                                _cancel_remaining_transfer_jobs(
+                                    session, futures, model=Video, reason=abort_reason
+                                )
+                                log.error(
+                                    "Stopping video transfer after rate-limit on %s",
+                                    job.youtube_video_id,
+                                )
+                                break
                             video.transfer_status = "failed"
                             video.transfer_error = f"Worker crashed: {exc}"[:2000]
+                            failed += 1
                             try:
                                 session.commit()
                             except Exception:
@@ -919,6 +1045,22 @@ def transfer_videos(
                         log.error("No DB row for transfer job %s", job.youtube_video_id)
                         continue
                     try:
+                        if result.get("rate_limit_abort"):
+                            _reset_job_to_pending(
+                                video, reason=result.get("error") or abort_reason
+                            )
+                            video.local_path = result.get("local_path")
+                            session.commit()
+                            _cancel_remaining_transfer_jobs(
+                                session, futures, model=Video, reason=abort_reason
+                            )
+                            log.error(
+                                "Stopping video transfer after YouTube rate-limit on %s. "
+                                "Remaining jobs left pending.",
+                                job.youtube_video_id,
+                            )
+                            break
+
                         if result["ok"]:
                             bunny_info = result["bunny"]
                             video.file_size = result.get("file_size")
@@ -971,6 +1113,13 @@ def transfer_videos(
                 root = settings.download_dir / creator_folder_name(creator_videos[0].creator)
                 if root.exists() and not any(root.iterdir()):
                     shutil.rmtree(root, ignore_errors=True)
+
+    if DOWNLOAD_GUARD.is_aborted():
+        log.error(
+            "Skipping shorts/playlists this run — YouTube rate-limit abort is active. "
+            "Re-run later with --retry-failed."
+        )
+        return uploaded, failed, 0
 
     if do_shorts:
         s_up, s_fail = transfer_shorts(
@@ -1080,6 +1229,10 @@ def transfer_shorts(
     )
     with ThreadPoolExecutor(max_workers=workers) as pool:
         futures = {pool.submit(_run_transfer_job, settings, job): job for job in jobs}
+        abort_reason = (
+            "Paused: YouTube rate-limit. Re-run with --retry-failed after cooldown "
+            "or after rotating cookies in YTDLP_COOKIES_DIR."
+        )
         for future in as_completed(futures):
             job = futures[future]
             result = future.result()
@@ -1087,6 +1240,20 @@ def transfer_shorts(
             if short is None:
                 continue
             try:
+                if result.get("rate_limit_abort"):
+                    _reset_job_to_pending(
+                        short, reason=result.get("error") or abort_reason
+                    )
+                    short.local_path = result.get("local_path")
+                    session.commit()
+                    _cancel_remaining_transfer_jobs(
+                        session, futures, model=Short, reason=abort_reason
+                    )
+                    log.error(
+                        "Stopping shorts transfer after YouTube rate-limit on %s",
+                        job.youtube_video_id,
+                    )
+                    break
                 if result["ok"]:
                     bunny_info = result["bunny"]
                     short.file_size = result.get("file_size")
@@ -1299,6 +1466,10 @@ def transfer_playlist_items(
     )
     with ThreadPoolExecutor(max_workers=workers) as pool:
         futures = {pool.submit(_run_transfer_job, settings, job): job for job in jobs}
+        abort_reason = (
+            "Paused: YouTube rate-limit. Re-run with --retry-failed after cooldown "
+            "or after rotating cookies in YTDLP_COOKIES_DIR."
+        )
         for future in as_completed(futures):
             job = futures[future]
             result = future.result()
@@ -1306,6 +1477,20 @@ def transfer_playlist_items(
             if item is None:
                 continue
             try:
+                if result.get("rate_limit_abort"):
+                    _reset_job_to_pending(
+                        item, reason=result.get("error") or abort_reason
+                    )
+                    item.local_path = result.get("local_path")
+                    session.commit()
+                    _cancel_remaining_transfer_jobs(
+                        session, futures, model=PlaylistItem, reason=abort_reason
+                    )
+                    log.error(
+                        "Stopping playlist transfer after YouTube rate-limit on %s",
+                        job.youtube_video_id,
+                    )
+                    break
                 if result["ok"]:
                     bunny_info = result["bunny"]
                     item.file_size = result.get("file_size")

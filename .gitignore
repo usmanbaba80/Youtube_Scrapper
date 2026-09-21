@@ -17,5 +17,15 @@ data/*.xls
 temp_downloads/
 
 data/exports/
+data/cookies/*.txt
+!data/cookies/README.md
+!data/cookies/.gitkeep
 logs/
 *.log
+
+# Local design / Lucid ERD assets — do not push to GitHub
+docs/
+docs/erd/
+*.drawio
+*erd*.png
+*erd*.svg
