@@ -135,6 +135,7 @@ def run_all(
             session,
             settings,
             retry_failed=retry_failed,
+            force=force,
             channel_ids=channel_ids,
             media_types=media_types,
         )

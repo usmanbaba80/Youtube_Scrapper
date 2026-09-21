@@ -88,8 +88,8 @@ def build_parser() -> argparse.ArgumentParser:
         "--force",
         action="store_true",
         help=(
-            "Re-scrape channels / re-upload thumbnails even if already on Bunny. "
-            "For thumbnails: only missing ones are uploaded unless --force is set"
+            "Re-scrape channels; re-transfer videos already on Bunny (download+upload again); "
+            "re-upload thumbnails even if already present"
         ),
     )
     return parser
@@ -170,6 +170,7 @@ def main() -> None:
                 session,
                 settings,
                 retry_failed=args.retry_failed,
+                force=args.force,
                 channel_ids=channel_ids,
                 media_types=media_types,
             )

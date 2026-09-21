@@ -786,10 +786,27 @@ class _DownloadTarget:
         self.title = title
 
 
+def _reset_uploaded_for_force(row, *, kind: str) -> str | None:
+    """
+    Clear Bunny Stream pointers so transfer will download+upload again.
+    Returns previous Stream video id (for optional delete), or None.
+    """
+    old = row.bunny_path
+    row.bunny_path = None
+    row.bunny_url = None
+    row.local_path = None
+    row.file_size = None
+    row.uploaded_at = None
+    row.transfer_status = "pending"
+    row.transfer_error = f"Force re-transfer ({kind})"
+    return old if old else None
+
+
 def _eligible_transfer_videos(
     session: Session,
     *,
     retry_failed: bool,
+    force: bool = False,
     channel_ids: list[int] | None = None,
     channel_id: int | None = None,
     max_per_channel: int,
@@ -797,7 +814,9 @@ def _eligible_transfer_videos(
     """Videos that need download and/or upload."""
     # Include stuck in-flight rows so a crashed run can resume.
     statuses = ["pending", "failed", "downloaded", "downloading", "uploading"]
-    if not retry_failed:
+    if force:
+        statuses = statuses + ["uploaded"]
+    elif not retry_failed:
         statuses = ["pending", "downloaded", "downloading", "uploading"]
 
     query = (
@@ -810,24 +829,37 @@ def _eligible_transfer_videos(
     if channel_ids is not None:
         query = query.filter(Video.creator_row_id.in_(channel_ids))
 
-    # Only fully uploaded videos consume the per-creator quota. Counting
-    # downloading/uploading/downloaded here blocked retries after crashes.
+    # Only fully uploaded videos consume the per-creator quota — unless forcing
+    # a re-transfer of those same rows.
     already_uploaded = dict(
         session.query(Video.creator_row_id, func.count(Video.id))
         .filter(Video.is_short.is_(False), Video.transfer_status == "uploaded")
         .group_by(Video.creator_row_id)
         .all()
     )
+    if force:
+        already_uploaded = {}
 
     selected: list[Video] = []
     queued: dict[int, int] = {}
+    old_stream_ids: list[str] = []
     for video in query.all():
+        if force and video.transfer_status == "uploaded":
+            old = _reset_uploaded_for_force(video, kind="videos")
+            if old:
+                old_stream_ids.append(old)
+
         # Already on Bunny but status never flipped (crash / commit failure).
         if video.bunny_path and video.transfer_status != "uploaded":
-            video.transfer_status = "uploaded"
-            video.transfer_error = None
-            video.local_path = None
-            continue
+            if force:
+                old = _reset_uploaded_for_force(video, kind="videos")
+                if old:
+                    old_stream_ids.append(old)
+            else:
+                video.transfer_status = "uploaded"
+                video.transfer_error = None
+                video.local_path = None
+                continue
 
         local = Path(video.local_path) if video.local_path else None
         local_ok = bool(local and local.exists())
@@ -849,7 +881,7 @@ def _eligible_transfer_videos(
             local_ok = False
 
         if video.transfer_status == "failed":
-            if not retry_failed:
+            if not retry_failed and not force:
                 continue
             if not local_ok:
                 video.local_path = None
@@ -866,6 +898,16 @@ def _eligible_transfer_videos(
             selected.append(video)
             if not local_ok:
                 queued[cid] = queued.get(cid, 0) + 1
+
+    if force and old_stream_ids:
+        log.info(
+            "Force re-transfer: reset %s uploaded video(s); will replace Stream files",
+            len(old_stream_ids),
+        )
+        # Stash on session.info for transfer_videos to delete after commit prep
+        session.info["force_delete_stream_ids"] = (
+            list(session.info.get("force_delete_stream_ids", [])) + old_stream_ids
+        )
 
     return selected
 
@@ -959,6 +1001,7 @@ def transfer_videos(
     settings: Settings,
     *,
     retry_failed: bool = False,
+    force: bool = False,
     channel_ids: list[int] | None = None,
     channel_id: int | None = None,
     media_types: frozenset[str] | set[str] | list[str] | str | None = None,
@@ -970,6 +1013,7 @@ def transfer_videos(
     stays bounded. Returns (uploaded, download_failed_or_upload_failed, skipped).
 
     ``media_types`` limits work to videos / shorts / playlists (None = all).
+    ``force`` re-downloads and re-uploads rows already marked uploaded.
     """
     DOWNLOAD_GUARD.reset_run()
     DOWNLOAD_GUARD.configure(settings)
@@ -982,8 +1026,9 @@ def transfer_videos(
     do_shorts = media_types is None or "shorts" in media_types
     do_playlists = media_types is None or "playlists" in media_types
     log.info(
-        "Transfer media filter: %s",
+        "Transfer media filter: %s%s",
         "all" if media_types is None else ",".join(sorted(media_types)),
+        " (force re-upload)" if force else "",
     )
 
     uploaded = 0
@@ -992,11 +1037,18 @@ def transfer_videos(
     if do_videos:
         videos = _eligible_transfer_videos(
             session,
-            retry_failed=retry_failed,
+            retry_failed=retry_failed or force,
+            force=force,
             channel_ids=channel_ids,
             max_per_channel=settings.max_videos_per_channel,
         )
+        # Delete previous Stream objects so force does not leave orphan 360p files.
+        stale_ids = list(session.info.pop("force_delete_stream_ids", []) or [])
         session.commit()
+        if force and stale_ids:
+            bunny_cleanup = BunnyStream(settings)
+            for vid in stale_ids:
+                bunny_cleanup.delete_video(vid)
     else:
         log.info("Skipping long-form videos (media filter)")
 
@@ -1202,7 +1254,8 @@ def transfer_videos(
         s_up, s_fail = transfer_shorts(
             session,
             settings,
-            retry_failed=retry_failed,
+            retry_failed=retry_failed or force,
+            force=force,
             channel_ids=channel_ids,
         )
     else:
@@ -1213,7 +1266,8 @@ def transfer_videos(
         p_up, p_fail = transfer_playlist_items(
             session,
             settings,
-            retry_failed=retry_failed,
+            retry_failed=retry_failed or force,
+            force=force,
             channel_ids=channel_ids,
         )
         # Playlist covers are metadata-only (no Stream file) — upload Storage thumbs here.
@@ -1230,18 +1284,25 @@ def transfer_shorts(
     settings: Settings,
     *,
     retry_failed: bool = False,
+    force: bool = False,
     channel_ids: list[int] | None = None,
     channel_id: int | None = None,
 ) -> tuple[int, int]:
     channel_ids = normalize_channel_ids(channel_ids, channel_id=channel_id)
     shorts = _eligible_transfer_shorts(
         session,
-        retry_failed=retry_failed,
+        retry_failed=retry_failed or force,
+        force=force,
         channel_ids=channel_ids,
         max_per_channel=settings.max_shorts_per_channel,
         max_duration_seconds=settings.max_short_duration_seconds,
     )
+    stale_ids = list(session.info.pop("force_delete_stream_ids", []) or [])
     session.commit()
+    if force and stale_ids:
+        bunny_cleanup = BunnyStream(settings)
+        for vid in stale_ids:
+            bunny_cleanup.delete_video(vid)
     if not shorts:
         log.info("No shorts waiting to transfer")
         return 0, 0
@@ -1377,13 +1438,16 @@ def _eligible_transfer_shorts(
     session: Session,
     *,
     retry_failed: bool,
+    force: bool = False,
     channel_ids: list[int] | None = None,
     channel_id: int | None = None,
     max_per_channel: int,
     max_duration_seconds: int = 180,
 ) -> list[Short]:
     statuses = ["pending", "failed", "downloaded", "downloading", "uploading"]
-    if not retry_failed:
+    if force:
+        statuses = statuses + ["uploaded"]
+    elif not retry_failed:
         statuses = ["pending", "downloaded", "downloading", "uploading"]
 
     query = (
@@ -1402,15 +1466,28 @@ def _eligible_transfer_shorts(
         .group_by(Short.creator_row_id)
         .all()
     )
+    if force:
+        already_uploaded = {}
 
     selected: list[Short] = []
     queued: dict[int, int] = {}
+    old_stream_ids: list[str] = []
     for short in query.all():
+        if force and short.transfer_status == "uploaded":
+            old = _reset_uploaded_for_force(short, kind="shorts")
+            if old:
+                old_stream_ids.append(old)
+
         if short.bunny_path and short.transfer_status != "uploaded":
-            short.transfer_status = "uploaded"
-            short.transfer_error = None
-            short.local_path = None
-            continue
+            if force:
+                old = _reset_uploaded_for_force(short, kind="shorts")
+                if old:
+                    old_stream_ids.append(old)
+            else:
+                short.transfer_status = "uploaded"
+                short.transfer_error = None
+                short.local_path = None
+                continue
 
         if (
             short.duration_seconds is not None
@@ -1440,7 +1517,7 @@ def _eligible_transfer_shorts(
             short.local_path = None
             local_ok = False
 
-        if short.transfer_status == "failed" and not retry_failed:
+        if short.transfer_status == "failed" and not retry_failed and not force:
             continue
 
         if short.transfer_status == "downloaded" and local_ok:
@@ -1456,6 +1533,12 @@ def _eligible_transfer_shorts(
             if not local_ok:
                 queued[cid] = queued.get(cid, 0) + 1
 
+    if force and old_stream_ids:
+        session.info["force_delete_stream_ids"] = (
+            list(session.info.get("force_delete_stream_ids", [])) + old_stream_ids
+        )
+        log.info("Force re-transfer: reset %s uploaded short(s)", len(old_stream_ids))
+
     return selected
 
 
@@ -1464,14 +1547,23 @@ def transfer_playlist_items(
     settings: Settings,
     *,
     retry_failed: bool = False,
+    force: bool = False,
     channel_ids: list[int] | None = None,
     channel_id: int | None = None,
 ) -> tuple[int, int]:
     channel_ids = normalize_channel_ids(channel_ids, channel_id=channel_id)
     items = _eligible_transfer_playlist_items(
-        session, retry_failed=retry_failed, channel_ids=channel_ids
+        session,
+        retry_failed=retry_failed or force,
+        force=force,
+        channel_ids=channel_ids,
     )
+    stale_ids = list(session.info.pop("force_delete_stream_ids", []) or [])
     session.commit()
+    if force and stale_ids:
+        bunny_cleanup = BunnyStream(settings)
+        for vid in stale_ids:
+            bunny_cleanup.delete_video(vid)
     if not items:
         log.info("No playlist-only videos waiting to transfer")
         return 0, 0
@@ -1609,12 +1701,15 @@ def _eligible_transfer_playlist_items(
     session: Session,
     *,
     retry_failed: bool,
+    force: bool = False,
     channel_ids: list[int] | None = None,
     channel_id: int | None = None,
 ) -> list[PlaylistItem]:
     """Unlinked playlist items only (already-in-videos/shorts stay skipped)."""
     statuses = ["pending", "failed", "downloaded", "downloading", "uploading"]
-    if not retry_failed:
+    if force:
+        statuses = statuses + ["uploaded"]
+    elif not retry_failed:
         statuses = ["pending", "downloaded", "downloading", "uploading"]
 
     query = (
@@ -1630,12 +1725,23 @@ def _eligible_transfer_playlist_items(
         query = query.filter(PlaylistItem.creator_row_id.in_(channel_ids))
 
     selected: list[PlaylistItem] = []
+    old_stream_ids: list[str] = []
     for item in query.all():
+        if force and item.transfer_status == "uploaded":
+            old = _reset_uploaded_for_force(item, kind="playlist_items")
+            if old:
+                old_stream_ids.append(old)
+
         if item.bunny_path and item.transfer_status != "uploaded":
-            item.transfer_status = "uploaded"
-            item.transfer_error = None
-            item.local_path = None
-            continue
+            if force:
+                old = _reset_uploaded_for_force(item, kind="playlist_items")
+                if old:
+                    old_stream_ids.append(old)
+            else:
+                item.transfer_status = "uploaded"
+                item.transfer_error = None
+                item.local_path = None
+                continue
 
         local = Path(item.local_path) if item.local_path else None
         local_ok = bool(local and local.exists())
@@ -1654,10 +1760,19 @@ def _eligible_transfer_playlist_items(
             item.local_path = None
             local_ok = False
 
-        if item.transfer_status == "failed" and not retry_failed:
+        if item.transfer_status == "failed" and not retry_failed and not force:
             continue
 
         if item.transfer_status in {"pending", "failed", "downloaded"}:
             selected.append(item)
+
+    if force and old_stream_ids:
+        session.info["force_delete_stream_ids"] = (
+            list(session.info.get("force_delete_stream_ids", [])) + old_stream_ids
+        )
+        log.info(
+            "Force re-transfer: reset %s uploaded playlist item(s)",
+            len(old_stream_ids),
+        )
 
     return selected
