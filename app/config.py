@@ -86,6 +86,8 @@ class Settings:
     cookies_from_browser: str | None
     ytdlp_format: str
     ytdlp_max_height: int
+    ytdlp_min_height: int
+    ytdlp_player_clients: str
     ytdlp_js_runtimes: str
     ytdlp_sleep_interval: float
     ytdlp_sleep_requests: float
@@ -143,6 +145,10 @@ def load_settings() -> Settings:
         # Prefer highest available video+audio (VP9/AV1 ok); ffmpeg remuxes to mp4.
         ytdlp_format=_env("YTDLP_FORMAT", "bv*+ba/b"),
         ytdlp_max_height=_env_height("YTDLP_MAX_HEIGHT", 1080),
+        # Reject downloads below this height and retry other clients (0 = allow any).
+        ytdlp_min_height=_env_height("YTDLP_MIN_HEIGHT", 720),
+        # Comma-separated override, e.g. web_safari,mweb,web
+        ytdlp_player_clients=_env("YTDLP_PLAYER_CLIENTS"),
         ytdlp_js_runtimes=_env("YTDLP_JS_RUNTIMES"),
         # yt-dlp built-in pauses (seconds). Cuts account-level rate limits.
         ytdlp_sleep_interval=float(_env("YTDLP_SLEEP_INTERVAL") or "5"),

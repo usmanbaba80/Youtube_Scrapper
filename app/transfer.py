@@ -152,11 +152,27 @@ def _prefer_english_audio() -> str:
     )
 
 
+def _player_clients(settings: Settings, *, use_cookies: bool) -> list[str]:
+    """
+    Pick YouTube Innertube clients that still expose HD formats.
+
+    With cookies, ``tv`` often marks formats DRM → yt-dlp keeps only progressive
+    format 18 (360p). Prefer ``web_safari`` (HLS, no GVS PO token) then ``mweb``.
+    """
+    raw = (settings.ytdlp_player_clients or "").strip()
+    if raw:
+        return [c.strip() for c in raw.split(",") if c.strip()]
+    if use_cookies:
+        return ["web_safari", "mweb", "web"]
+    return ["android_vr", "web_safari", "tv", "web"]
+
+
 def _ytdlp_download_opts(
     settings: Settings,
     output_dir: Path,
     *,
     cookiefile: Path | None = None,
+    player_clients: list[str] | None = None,
 ) -> dict:
     js_runtimes = _resolve_js_runtimes(settings)
     ffmpeg_location = _resolve_ffmpeg_location(settings)
@@ -171,29 +187,27 @@ def _ytdlp_download_opts(
         )
 
     max_h = max(settings.ytdlp_max_height, 360)
-    # Prefer target height (default 1080), then next-best, then any.
-    # Do NOT use web/android alone — they often only expose 360p without PO tokens.
-    # Audio: English first, then original/best when English is missing.
+    # Prefer target height (default 1080), then 720+, then any adaptive — avoid
+    # falling straight to progressive format 18 (360p) when HD exists.
     audio = _prefer_english_audio()
     format_selector = settings.ytdlp_format
     if format_selector == "bv*+ba/b":
         prefer = min(max_h, 1080)
         format_selector = (
             f"bv*[height>={prefer}][height<=?{max_h}]+({audio})/"
+            f"bestvideo[height>={prefer}][height<=?{max_h}]+({audio})/"
             f"bv*[height>=720][height<=?{max_h}]+({audio})/"
+            f"bestvideo[height>=720][height<=?{max_h}]+({audio})/"
             f"bv*[height<=?{max_h}]+({audio})/"
+            f"b[height>={prefer}][height<=?{max_h}]/"
+            f"b[height>=720]/"
             f"bv*+({audio})/b"
         )
 
     use_cookies = bool(
         cookiefile or settings.cookies_file or settings.cookies_from_browser
     )
-    # Fewer player clients = fewer API hits per video (major rate-limit cause).
-    player_clients = (
-        ["tv", "web"]
-        if use_cookies
-        else ["android_vr", "tv", "web_safari", "web"]
-    )
+    clients = player_clients or _player_clients(settings, use_cookies=use_cookies)
 
     sleep_dl = max(0.0, float(settings.ytdlp_sleep_interval))
     sleep_req = max(0.0, float(settings.ytdlp_sleep_requests))
@@ -201,7 +215,7 @@ def _ytdlp_download_opts(
     opts: dict = {
         "format": format_selector,
         # Prefer English when several audio tracks share the same video quality.
-        "format_sort": ["lang:en", "res", "vbr", "abr", "size"],
+        "format_sort": ["res", "lang:en", "vbr", "abr", "size"],
         "format_sort_force": True,
         "merge_output_format": "mp4",
         "outtmpl": str(output_dir / "%(id)s.%(ext)s"),
@@ -232,7 +246,7 @@ def _ytdlp_download_opts(
         "sleep_interval_requests": sleep_req,
         "extractor_args": {
             "youtube": {
-                "player_client": player_clients,
+                "player_client": clients,
             }
         },
     }
@@ -249,54 +263,113 @@ def _ytdlp_download_opts(
     return opts
 
 
+class LowResolutionError(RuntimeError):
+    """Downloaded file is below YTDLP_MIN_HEIGHT — retry with other clients."""
+
+    def __init__(self, height: int | None, video_id: str, path: Path | None = None):
+        self.height = height
+        self.path = path
+        super().__init__(
+            f"Got {height or '?'}p for {video_id} (below YTDLP_MIN_HEIGHT); "
+            "will retry other player clients"
+        )
+
+
 def download_video(settings: Settings, video: Video, output_dir: Path) -> Path:
     output_dir.mkdir(parents=True, exist_ok=True)
     DOWNLOAD_GUARD.configure(settings)
     attempts = max(1, settings.download_retries)
     last_error: Exception | None = None
+    min_h = max(0, int(settings.ytdlp_min_height))
 
     log.info("Downloading %s (%s)", video.youtube_video_id, video.title or video.url)
 
     while True:
         DOWNLOAD_GUARD.raise_if_aborted()
         cookiefile = DOWNLOAD_GUARD.acquire(settings)
+        use_cookies = bool(cookiefile or settings.cookies_from_browser)
+        client_plans: list[list[str]] = [
+            _player_clients(settings, use_cookies=use_cookies),
+            ["mweb", "web_safari", "web"],
+            ["web_safari", "web"],
+        ]
+        seen_plans: set[tuple[str, ...]] = set()
+        unique_plans: list[list[str]] = []
+        for plan in client_plans:
+            key = tuple(plan)
+            if key in seen_plans:
+                continue
+            seen_plans.add(key)
+            unique_plans.append(plan)
+
         released = False
         try:
-            opts = _ytdlp_download_opts(settings, output_dir, cookiefile=cookiefile)
             rate_limited = False
-            for attempt in range(1, attempts + 1):
-                try:
-                    filepath = _ytdlp_fetch_file(opts, video, output_dir)
-                    DOWNLOAD_GUARD.release(ok=True)
-                    released = True
-                    return filepath
-                except Exception as exc:
-                    last_error = exc
-                    if is_youtube_rate_limited(exc):
-                        rate_limited = True
-                        break
-                    message = str(exc).lower()
-                    retryable = any(
-                        token in message
-                        for token in (
-                            "403",
-                            "forbidden",
-                            "timed out",
-                            "timeout",
+            for plan_i, clients in enumerate(unique_plans):
+                opts = _ytdlp_download_opts(
+                    settings,
+                    output_dir,
+                    cookiefile=cookiefile,
+                    player_clients=clients,
+                )
+                log.info(
+                    "yt-dlp player clients for %s: %s",
+                    video.youtube_video_id,
+                    ",".join(clients),
+                )
+                for attempt in range(1, attempts + 1):
+                    try:
+                        filepath = _ytdlp_fetch_file(
+                            opts, video, output_dir, min_height=min_h
                         )
-                    )
-                    if attempt >= attempts or not retryable:
+                        DOWNLOAD_GUARD.release(ok=True)
+                        released = True
+                        return filepath
+                    except LowResolutionError as exc:
+                        last_error = exc
+                        if exc.path and exc.path.exists():
+                            exc.path.unlink(missing_ok=True)
+                        log.warning(
+                            "%s (plan %s/%s)",
+                            exc,
+                            plan_i + 1,
+                            len(unique_plans),
+                        )
+                        if plan_i + 1 < len(unique_plans):
+                            break  # try next client plan
                         raise
-                    sleep_for = min(2 ** attempt, 45)
-                    log.warning(
-                        "Download attempt %s/%s failed for %s (%s). Retrying in %ss...",
-                        attempt,
-                        attempts,
-                        video.youtube_video_id,
-                        exc,
-                        sleep_for,
-                    )
-                    time.sleep(sleep_for)
+                    except Exception as exc:
+                        last_error = exc
+                        if is_youtube_rate_limited(exc):
+                            rate_limited = True
+                            break
+                        message = str(exc).lower()
+                        retryable = any(
+                            token in message
+                            for token in (
+                                "403",
+                                "forbidden",
+                                "timed out",
+                                "timeout",
+                                "requested format is not available",
+                            )
+                        )
+                        if attempt >= attempts or not retryable:
+                            raise
+                        sleep_for = min(2 ** attempt, 45)
+                        log.warning(
+                            "Download attempt %s/%s failed for %s (%s). Retrying in %ss...",
+                            attempt,
+                            attempts,
+                            video.youtube_video_id,
+                            exc,
+                            sleep_for,
+                        )
+                        time.sleep(sleep_for)
+                if rate_limited:
+                    break
+            else:
+                raise RuntimeError(str(last_error) if last_error else "Download failed")
 
             if rate_limited:
                 DOWNLOAD_GUARD.release(ok=False)
@@ -310,11 +383,17 @@ def download_video(settings: Settings, video: Video, output_dir: Path) -> Path:
             if not released:
                 DOWNLOAD_GUARD.release(ok=False)
 
-def _ytdlp_fetch_file(opts: dict, video: Video, output_dir: Path) -> Path:
+
+def _ytdlp_fetch_file(
+    opts: dict,
+    video: Video,
+    output_dir: Path,
+    *,
+    min_height: int = 0,
+) -> Path:
     """Run one yt-dlp download and return the local file path."""
     with YoutubeDL(opts) as ydl:
         # Single extract+download (match_filter rejects live).
-        # A separate probe doubled YouTube API hits and worsened rate limits.
         info = ydl.extract_info(video.url, download=True)
         if not info:
             raise RuntimeError("yt-dlp returned no info after download")
@@ -325,19 +404,13 @@ def _ytdlp_fetch_file(opts: dict, video: Video, output_dir: Path) -> Path:
                 (fmt.get("height") or 0 for fmt in info["requested_formats"]),
                 default=0,
             ) or None
+        format_id = info.get("format_id") or "unknown"
         log.info(
             "Selected format %s (%s) for %s",
-            info.get("format_id") or "unknown",
+            format_id,
             f"{height}p" if height else (info.get("resolution") or "unknown"),
             video.youtube_video_id,
         )
-        if height and height < 720:
-            log.warning(
-                "Low resolution %sp for %s — source may not offer HD, "
-                "or YouTube blocked higher formats",
-                height,
-                video.youtube_video_id,
-            )
 
         requested = info.get("requested_downloads") or []
         filepath = None
@@ -363,6 +436,10 @@ def _ytdlp_fetch_file(opts: dict, video: Video, output_dir: Path) -> Path:
                 f"Downloaded file not found for {video.youtube_video_id}"
             )
         filepath = matches[0]
+
+    if min_height > 0 and (height is None or height < min_height):
+        raise LowResolutionError(height, video.youtube_video_id, filepath)
+
     return filepath
 
 
