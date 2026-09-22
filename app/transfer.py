@@ -288,10 +288,11 @@ def download_video(settings: Settings, video: Video, output_dir: Path) -> Path:
         DOWNLOAD_GUARD.raise_if_aborted()
         cookiefile = DOWNLOAD_GUARD.acquire(settings)
         use_cookies = bool(cookiefile or settings.cookies_from_browser)
+        # Prefer HD clients first; later plans try alternate stacks (incl. tv).
         client_plans: list[list[str]] = [
             _player_clients(settings, use_cookies=use_cookies),
             ["mweb", "web_safari", "web"],
-            ["web_safari", "web"],
+            ["tv", "web_safari", "mweb", "web"],
         ]
         seen_plans: set[tuple[str, ...]] = set()
         unique_plans: list[list[str]] = []
@@ -302,6 +303,8 @@ def download_video(settings: Settings, video: Video, output_dir: Path) -> Path:
             seen_plans.add(key)
             unique_plans.append(plan)
 
+        best_path: Path | None = None
+        best_height = -1
         released = False
         try:
             rate_limited = False
@@ -322,28 +325,56 @@ def download_video(settings: Settings, video: Video, output_dir: Path) -> Path:
                         filepath = _ytdlp_fetch_file(
                             opts, video, output_dir, min_height=min_h
                         )
+                        # Prefer HD success; drop any lower-res candidate.
+                        if best_path and best_path.exists() and best_path != filepath:
+                            best_path.unlink(missing_ok=True)
                         DOWNLOAD_GUARD.release(ok=True)
                         released = True
                         return filepath
                     except LowResolutionError as exc:
                         last_error = exc
+                        # Keep the best usable file; do not delete until a better one lands.
                         if exc.path and exc.path.exists():
-                            exc.path.unlink(missing_ok=True)
-                        log.warning(
-                            "%s (plan %s/%s)",
-                            exc,
-                            plan_i + 1,
-                            len(unique_plans),
-                        )
-                        if plan_i + 1 < len(unique_plans):
-                            break  # try next client plan
-                        raise
+                            h = exc.height or 0
+                            if h > best_height:
+                                if best_path and best_path != exc.path and best_path.exists():
+                                    best_path.unlink(missing_ok=True)
+                                best_path = exc.path
+                                best_height = h
+                                log.warning(
+                                    "Keeping %sp candidate for %s; trying other clients "
+                                    "for >=%sp (plan %s/%s)",
+                                    h,
+                                    video.youtube_video_id,
+                                    min_h,
+                                    plan_i + 1,
+                                    len(unique_plans),
+                                )
+                            elif exc.path != best_path:
+                                exc.path.unlink(missing_ok=True)
+                        break  # next client plan (no point re-downloading same clients)
                     except Exception as exc:
                         last_error = exc
                         if is_youtube_rate_limited(exc):
                             rate_limited = True
                             break
                         message = str(exc).lower()
+                        # These mean this client stack can't serve video — switch plan.
+                        switch_plan = any(
+                            token in message
+                            for token in (
+                                "requested format is not available",
+                                "only images are available",
+                                "format is not available",
+                            )
+                        )
+                        if switch_plan:
+                            log.warning(
+                                "Client plan failed for %s (%s); trying next plan",
+                                video.youtube_video_id,
+                                exc,
+                            )
+                            break
                         retryable = any(
                             token in message
                             for token in (
@@ -351,11 +382,10 @@ def download_video(settings: Settings, video: Video, output_dir: Path) -> Path:
                                 "forbidden",
                                 "timed out",
                                 "timeout",
-                                "requested format is not available",
                             )
                         )
                         if attempt >= attempts or not retryable:
-                            raise
+                            break  # try next plan instead of aborting whole download
                         sleep_for = min(2 ** attempt, 45)
                         log.warning(
                             "Download attempt %s/%s failed for %s (%s). Retrying in %ss...",
@@ -368,8 +398,19 @@ def download_video(settings: Settings, video: Video, output_dir: Path) -> Path:
                         time.sleep(sleep_for)
                 if rate_limited:
                     break
-            else:
-                raise RuntimeError(str(last_error) if last_error else "Download failed")
+
+            # No plan met YTDLP_MIN_HEIGHT — accept best usable download if we have one.
+            if best_path is not None and best_path.exists():
+                log.warning(
+                    "Accepting best available %sp for %s (wanted >=%sp). "
+                    "Source/clients did not expose higher formats.",
+                    best_height if best_height > 0 else "?",
+                    video.youtube_video_id,
+                    min_h,
+                )
+                DOWNLOAD_GUARD.release(ok=True)
+                released = True
+                return best_path
 
             if rate_limited:
                 DOWNLOAD_GUARD.release(ok=False)
