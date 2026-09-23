@@ -323,13 +323,13 @@ def download_video(settings: Settings, video: Video, output_dir: Path) -> Path:
             )
 
         # Each plan: (clients, use_cookie_file).
-        # Last plan drops cookies — logged-in sessions often get googlevideo 403
-        # on progressive format 18 while guest ios/tv still works.
+        # After the first cookie 403, try guest ios/tv immediately — logged-in
+        # sessions often get googlevideo 403 on format 18 while guest still works.
         plan_specs: list[tuple[list[str], bool]] = [
             (_player_clients(settings, use_cookies=use_cookies), True),
-            (["mweb", "web", "tv"], True),
-            (["tv", "mweb", "web"], True),
             (["ios", "tv", "tv_simply"], False),
+            (["mweb", "tv", "web"], True),
+            (["tv", "web"], True),
         ]
         seen_plans: set[tuple[str, ...]] = set()
         unique_plans: list[tuple[list[str], bool]] = []
