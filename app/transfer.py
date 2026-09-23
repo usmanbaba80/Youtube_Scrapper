@@ -35,6 +35,7 @@ from app.utils import (
 from app.ytdlp_guard import (
     DOWNLOAD_GUARD,
     RateLimitAbort,
+    is_youtube_bot_check,
     is_youtube_rate_limited,
 )
 
@@ -156,15 +157,18 @@ def _player_clients(settings: Settings, *, use_cookies: bool) -> list[str]:
     """
     Pick YouTube Innertube clients that still expose HD formats.
 
-    With cookies, ``tv`` often marks formats DRM → yt-dlp keeps only progressive
-    format 18 (360p). Prefer ``web_safari`` (HLS, no GVS PO token) then ``mweb``.
+    Prefer ``mweb`` / ``web`` (HTTPS/DASH). Put ``web_safari`` last — its HLS
+    (m3u8) formats often 403 on every fragment when the n-sig/PO token is wrong.
     """
     raw = (settings.ytdlp_player_clients or "").strip()
     if raw:
         return [c.strip() for c in raw.split(",") if c.strip()]
-    if use_cookies:
-        return ["web_safari", "mweb", "web"]
-    return ["android_vr", "web_safari", "tv", "web"]
+    cookie_mode = use_cookies or bool(
+        settings.cookies_file or settings.cookies_dir or settings.cookies_from_browser
+    )
+    if cookie_mode:
+        return ["mweb", "web", "tv", "web_safari"]
+    return ["mweb", "tv", "web", "web_safari"]
 
 
 def _ytdlp_download_opts(
@@ -173,6 +177,7 @@ def _ytdlp_download_opts(
     *,
     cookiefile: Path | None = None,
     player_clients: list[str] | None = None,
+    prefer_https: bool = True,
 ) -> dict:
     js_runtimes = _resolve_js_runtimes(settings)
     ffmpeg_location = _resolve_ffmpeg_location(settings)
@@ -187,20 +192,23 @@ def _ytdlp_download_opts(
         )
 
     max_h = max(settings.ytdlp_max_height, 360)
-    # Prefer target height (default 1080), then 720+, then any adaptive — avoid
-    # falling straight to progressive format 18 (360p) when HD exists.
     audio = _prefer_english_audio()
     format_selector = settings.ytdlp_format
     if format_selector == "bv*+ba/b":
         prefer = min(max_h, 1080)
+        # Prefer HTTPS/DASH over HLS (m3u8). web_safari HLS often 403s fragments.
+        https = "[protocol^=http][protocol!*=m3u8]" if prefer_https else ""
         format_selector = (
+            f"bv*{https}[height>={prefer}][height<=?{max_h}]+({audio})/"
+            f"bestvideo{https}[height>={prefer}][height<=?{max_h}]+({audio})/"
+            f"bv*{https}[height>=720][height<=?{max_h}]+({audio})/"
+            f"bestvideo{https}[height>=720][height<=?{max_h}]+({audio})/"
+            f"bv*{https}[height<=?{max_h}]+({audio})/"
+            f"b{https}[height>={prefer}][height<=?{max_h}]/"
+            f"b{https}[height>=720]/"
+            # Last resort: allow HLS if nothing else is offered.
             f"bv*[height>={prefer}][height<=?{max_h}]+({audio})/"
-            f"bestvideo[height>={prefer}][height<=?{max_h}]+({audio})/"
             f"bv*[height>=720][height<=?{max_h}]+({audio})/"
-            f"bestvideo[height>=720][height<=?{max_h}]+({audio})/"
-            f"bv*[height<=?{max_h}]+({audio})/"
-            f"b[height>={prefer}][height<=?{max_h}]/"
-            f"b[height>=720]/"
             f"bv*+({audio})/b"
         )
 
@@ -214,22 +222,23 @@ def _ytdlp_download_opts(
 
     opts: dict = {
         "format": format_selector,
-        # Prefer English when several audio tracks share the same video quality.
-        "format_sort": ["res", "lang:en", "vbr", "abr", "size"],
+        # Prefer HTTPS over HLS, then resolution.
+        "format_sort": ["proto:https", "res", "lang:en", "vbr", "abr", "size"],
         "format_sort_force": True,
         "merge_output_format": "mp4",
         "outtmpl": str(output_dir / "%(id)s.%(ext)s"),
         "noplaylist": True,
         "ignoreerrors": False,
-        "retries": 10,
-        "fragment_retries": 10,
-        "file_access_retries": 5,
+        "retries": 5,
+        # Fail fast on HLS 403 storms instead of 10×30s per fragment × N fragments.
+        "fragment_retries": 2,
+        "file_access_retries": 3,
+        "skip_unavailable_fragments": False,
         "retry_sleep_functions": {
-            "http": lambda n: min(2 ** n, 30),
-            "fragment": lambda n: min(2 ** n, 30),
+            "http": lambda n: min(2 ** n, 15),
+            "fragment": lambda n: min(2 ** n, 8),
             "file_access": lambda n: min(2 ** n, 10),
         },
-        # High concurrency against googlevideo often triggers intermittent 403s.
         "concurrent_fragment_downloads": 1,
         "overwrites": True,
         "noprogress": False,
@@ -237,10 +246,8 @@ def _ytdlp_download_opts(
         "no_warnings": False,
         "restrictfilenames": True,
         "remote_components": ["ejs:github"],
-        # Never follow endless live HLS.
         "match_filter": _reject_live_or_premiere,
         "wait_for_video": None,
-        # yt-dlp recommended sleeps to avoid account rate limits.
         "sleep_interval": sleep_dl,
         "max_sleep_interval": max(sleep_dl, sleep_dl * 2) if sleep_dl else 0,
         "sleep_interval_requests": sleep_req,
@@ -288,11 +295,20 @@ def download_video(settings: Settings, video: Video, output_dir: Path) -> Path:
         DOWNLOAD_GUARD.raise_if_aborted()
         cookiefile = DOWNLOAD_GUARD.acquire(settings)
         use_cookies = bool(cookiefile or settings.cookies_from_browser)
-        # Prefer HD clients first; later plans try alternate stacks (incl. tv).
+        if cookiefile:
+            log.info("Using YouTube cookies: %s", cookiefile.name)
+        else:
+            log.error(
+                "No cookie file loaded for %s — expect bot-check. "
+                "Put Netscape cookies.txt under YTDLP_COOKIES_DIR.",
+                video.youtube_video_id,
+            )
+        # Prefer HTTPS clients first; web_safari HLS last (often fragment 403).
         client_plans: list[list[str]] = [
             _player_clients(settings, use_cookies=use_cookies),
-            ["mweb", "web_safari", "web"],
-            ["tv", "web_safari", "mweb", "web"],
+            ["mweb", "web", "tv"],
+            ["tv", "mweb", "web"],
+            ["web_safari", "mweb", "web"],  # HLS last resort
         ]
         seen_plans: set[tuple[str, ...]] = set()
         unique_plans: list[list[str]] = []
@@ -355,6 +371,15 @@ def download_video(settings: Settings, video: Video, output_dir: Path) -> Path:
                         break  # next client plan (no point re-downloading same clients)
                     except Exception as exc:
                         last_error = exc
+                        if is_youtube_bot_check(exc):
+                            DOWNLOAD_GUARD.release(ok=False)
+                            released = True
+                            DOWNLOAD_GUARD.trip_bot_check(
+                                settings, video_id=video.youtube_video_id
+                            )
+                            # Cool down / rotate, then retry outer while with new cookies.
+                            rate_limited = True
+                            break
                         if is_youtube_rate_limited(exc):
                             rate_limited = True
                             break
@@ -366,14 +391,38 @@ def download_video(settings: Settings, video: Video, output_dir: Path) -> Path:
                                 "requested format is not available",
                                 "only images are available",
                                 "format is not available",
+                                "http error 403",
+                                "403: forbidden",
+                                "fragment not found",
+                                "unable to download",
                             )
                         )
                         if switch_plan:
                             log.warning(
                                 "Client plan failed for %s (%s); trying next plan",
                                 video.youtube_video_id,
-                                exc,
+                                str(exc)[:300],
                             )
+                            # Drop incomplete HLS leftovers; keep any prior best candidate.
+                            protected = (
+                                {best_path.resolve()}
+                                if best_path is not None and best_path.exists()
+                                else set()
+                            )
+                            for partial in output_dir.glob(f"{video.youtube_video_id}*"):
+                                try:
+                                    if partial.resolve() in protected:
+                                        continue
+                                except OSError:
+                                    continue
+                                if partial.suffix.lower() in {
+                                    ".part",
+                                    ".ytdl",
+                                    ".mp4",
+                                    ".m4a",
+                                    ".webm",
+                                }:
+                                    partial.unlink(missing_ok=True)
                             break
                         retryable = any(
                             token in message
@@ -400,7 +449,7 @@ def download_video(settings: Settings, video: Video, output_dir: Path) -> Path:
                     break
 
             # No plan met YTDLP_MIN_HEIGHT — accept best usable download if we have one.
-            if best_path is not None and best_path.exists():
+            if not rate_limited and best_path is not None and best_path.exists():
                 log.warning(
                     "Accepting best available %sp for %s (wanted >=%sp). "
                     "Source/clients did not expose higher formats.",
@@ -413,11 +462,16 @@ def download_video(settings: Settings, video: Video, output_dir: Path) -> Path:
                 return best_path
 
             if rate_limited:
-                DOWNLOAD_GUARD.release(ok=False)
-                released = True
-                DOWNLOAD_GUARD.trip_rate_limit(
-                    settings, video_id=video.youtube_video_id
-                )
+                if not released:
+                    DOWNLOAD_GUARD.release(ok=False)
+                    released = True
+                if is_youtube_bot_check(last_error or ""):
+                    # trip_bot_check already raised or set cooldown
+                    pass
+                elif last_error and is_youtube_rate_limited(last_error):
+                    DOWNLOAD_GUARD.trip_rate_limit(
+                        settings, video_id=video.youtube_video_id
+                    )
                 continue
             raise RuntimeError(str(last_error) if last_error else "Download failed")
         finally:
