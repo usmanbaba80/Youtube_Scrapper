@@ -19,9 +19,22 @@ _RATE_LIMIT_MARKERS = (
 )
 
 
+_BOT_CHECK_MARKERS = (
+    "sign in to confirm you’re not a bot",
+    "sign in to confirm you're not a bot",
+    "confirm you're not a bot",
+    "confirm you’re not a bot",
+)
+
+
 def is_youtube_rate_limited(exc: BaseException | str) -> bool:
     text = str(exc).lower()
     return any(token in text for token in _RATE_LIMIT_MARKERS)
+
+
+def is_youtube_bot_check(exc: BaseException | str) -> bool:
+    text = str(exc).lower()
+    return any(token in text for token in _BOT_CHECK_MARKERS)
 
 
 class RateLimitAbort(RuntimeError):
@@ -129,9 +142,9 @@ class YoutubeDownloadGuard:
         self._cookies: CookiePool | None = None
         self._configured = False
 
-    def configure(self, settings) -> None:
+    def configure(self, settings, *, force_reload: bool = False) -> None:
         with self._lock:
-            if self._configured:
+            if self._configured and not force_reload:
                 return
             self._cookies = CookiePool.from_settings(
                 cookies_file=settings.cookies_file,
@@ -147,15 +160,16 @@ class YoutubeDownloadGuard:
                     settings.cookies_from_browser,
                 )
             elif settings.cookies_dir or settings.cookies_file:
-                log.warning(
-                    "Cookie path configured but no .txt files found yet "
-                    "(expected under %s). Add account1.txt, account2.txt, …",
+                log.error(
+                    "Cookie path configured but no .txt files found "
+                    "(expected under %s). Anonymous downloads will hit bot-check. "
+                    "Export fresh Netscape cookies into that folder.",
                     settings.cookies_dir or settings.cookies_file,
                 )
             else:
-                log.warning(
+                log.error(
                     "No YTDLP_COOKIES / YTDLP_COOKIES_DIR configured — "
-                    "anonymous downloads hit rate limits much faster"
+                    "YouTube will bot-check / rate-limit anonymous downloads"
                 )
 
     def reset_run(self) -> None:
@@ -164,7 +178,44 @@ class YoutubeDownloadGuard:
             self._abort = False
             self._abort_reason = ""
             self._cooldown_rounds = 0
-            # keep cookie index + cooldown clock across a single process if needed
+            # Reload cookie files so newly dropped cookies.txt are picked up.
+            self._configured = False
+
+    def has_cookies(self) -> bool:
+        with self._lock:
+            return bool(self._cookies and self._cookies.size)
+
+    def trip_bot_check(self, settings, *, video_id: str) -> None:
+        """
+        Bot-check usually means dead/missing cookies. Rotate if possible, else abort.
+        """
+        self.configure(settings)
+        with self._lock:
+            self._cooldown_rounds += 1
+            cooldown = max(60.0, min(600.0, float(settings.rate_limit_cooldown_seconds) / 6))
+            self._cooldown_until = time.time() + cooldown
+            rotated = None
+            if self._cookies and self._cookies.size > 1:
+                rotated = self._cookies.rotate()
+            log.error(
+                "YouTube bot-check on %s (round %s/%s). "
+                "Cookies are missing, expired, or invalid%s. Cooling %.0fs.",
+                video_id,
+                self._cooldown_rounds,
+                settings.rate_limit_max_cooldowns,
+                f"; switched → {rotated.name}" if rotated else "",
+                cooldown,
+            )
+            if self._cooldown_rounds >= max(1, settings.rate_limit_max_cooldowns) or (
+                not self._cookies or self._cookies.size <= 1
+            ):
+                self._abort = True
+                self._abort_reason = (
+                    "YouTube bot-check (Sign in to confirm you’re not a bot). "
+                    "Export fresh cookies to YTDLP_COOKIES_DIR (Netscape .txt) "
+                    "and re-run. Anonymous / android_vr downloads will not work."
+                )
+                raise RateLimitAbort(self._abort_reason)
 
     def cookiefile(self) -> Path | None:
         assert self._cookies is not None

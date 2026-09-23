@@ -35,9 +35,16 @@ from app.utils import (
 from app.ytdlp_guard import (
     DOWNLOAD_GUARD,
     RateLimitAbort,
-    is_youtube_bot_check,
     is_youtube_rate_limited,
 )
+
+try:
+    from app.ytdlp_guard import is_youtube_bot_check
+except ImportError:  # older ytdlp_guard.py on another machine
+
+    def is_youtube_bot_check(exc: BaseException | str) -> bool:
+        text = str(exc).lower()
+        return "confirm you" in text and "not a bot" in text
 
 log = logging.getLogger(__name__)
 
