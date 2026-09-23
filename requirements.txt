@@ -3,4 +3,4 @@ psycopg2-binary>=2.9.9
 openpyxl>=3.1.5
 python-dotenv>=1.0.1
 requests>=2.32.3
-yt-dlp[default]>=2025.8.11
+yt-dlp[default]>=2025.9.5

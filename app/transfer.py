@@ -160,12 +160,18 @@ def _prefer_english_audio() -> str:
     )
 
 
+def _watch_url(video_id: str) -> str:
+    """Always use /watch?v= — /shorts/ URLs behave worse with some player clients."""
+    return f"https://www.youtube.com/watch?v={video_id}"
+
+
 def _player_clients(settings: Settings, *, use_cookies: bool) -> list[str]:
     """
     Pick YouTube Innertube clients that still expose HD formats.
 
-    Prefer ``mweb`` / ``web`` (HTTPS/DASH). Put ``web_safari`` last — its HLS
-    (m3u8) formats often 403 on every fragment when the n-sig/PO token is wrong.
+    Prefer ``mweb`` / ``web`` / ``tv`` (HTTPS). Put ``web_safari`` last — HLS
+    often 403s. Cookie accounts can still get CDN 403 on format 18 when the
+    GVS PO token is bad; a later cookie-less ios/tv plan may work.
     """
     raw = (settings.ytdlp_player_clients or "").strip()
     if raw:
@@ -175,7 +181,7 @@ def _player_clients(settings: Settings, *, use_cookies: bool) -> list[str]:
     )
     if cookie_mode:
         return ["mweb", "web", "tv", "web_safari"]
-    return ["mweb", "tv", "web", "web_safari"]
+    return ["ios", "tv", "mweb", "web"]
 
 
 def _ytdlp_download_opts(
@@ -185,6 +191,7 @@ def _ytdlp_download_opts(
     cookiefile: Path | None = None,
     player_clients: list[str] | None = None,
     prefer_https: bool = True,
+    force_no_cookies: bool = False,
 ) -> dict:
     js_runtimes = _resolve_js_runtimes(settings)
     ffmpeg_location = _resolve_ffmpeg_location(settings)
@@ -219,7 +226,7 @@ def _ytdlp_download_opts(
             f"bv*+({audio})/b"
         )
 
-    use_cookies = bool(
+    use_cookies = (not force_no_cookies) and bool(
         cookiefile or settings.cookies_file or settings.cookies_from_browser
     )
     clients = player_clients or _player_clients(settings, use_cookies=use_cookies)
@@ -268,7 +275,9 @@ def _ytdlp_download_opts(
         opts["js_runtimes"] = js_runtimes
     if ffmpeg_location:
         opts["ffmpeg_location"] = ffmpeg_location
-    if cookiefile is not None:
+    if force_no_cookies:
+        pass  # guest ios/tv plan — do not attach cookies
+    elif cookiefile is not None:
         opts["cookiefile"] = str(cookiefile)
     elif settings.cookies_file:
         opts["cookiefile"] = str(settings.cookies_file)
@@ -295,6 +304,8 @@ def download_video(settings: Settings, video: Video, output_dir: Path) -> Path:
     attempts = max(1, settings.download_retries)
     last_error: Exception | None = None
     min_h = max(0, int(settings.ytdlp_min_height))
+    # Normalize shorts URLs — player clients are more reliable on /watch?v=.
+    download_url = _watch_url(video.youtube_video_id)
 
     log.info("Downloading %s (%s)", video.youtube_video_id, video.title or video.url)
 
@@ -310,45 +321,57 @@ def download_video(settings: Settings, video: Video, output_dir: Path) -> Path:
                 "Put Netscape cookies.txt under YTDLP_COOKIES_DIR.",
                 video.youtube_video_id,
             )
-        # Prefer HTTPS clients first; web_safari HLS last (often fragment 403).
-        client_plans: list[list[str]] = [
-            _player_clients(settings, use_cookies=use_cookies),
-            ["mweb", "web", "tv"],
-            ["tv", "mweb", "web"],
-            ["web_safari", "mweb", "web"],  # HLS last resort
+
+        # Each plan: (clients, use_cookie_file).
+        # Last plan drops cookies — logged-in sessions often get googlevideo 403
+        # on progressive format 18 while guest ios/tv still works.
+        plan_specs: list[tuple[list[str], bool]] = [
+            (_player_clients(settings, use_cookies=use_cookies), True),
+            (["mweb", "web", "tv"], True),
+            (["tv", "mweb", "web"], True),
+            (["ios", "tv", "tv_simply"], False),
         ]
         seen_plans: set[tuple[str, ...]] = set()
-        unique_plans: list[list[str]] = []
-        for plan in client_plans:
-            key = tuple(plan)
+        unique_plans: list[tuple[list[str], bool]] = []
+        for clients, with_cookies in plan_specs:
+            if with_cookies and not use_cookies:
+                continue
+            key = (*clients, "c" if with_cookies else "anon")
             if key in seen_plans:
                 continue
             seen_plans.add(key)
-            unique_plans.append(plan)
+            unique_plans.append((clients, with_cookies))
 
         best_path: Path | None = None
         best_height = -1
         released = False
+        cdn_403_plans = 0
         try:
             rate_limited = False
-            for plan_i, clients in enumerate(unique_plans):
+            for plan_i, (clients, with_cookies) in enumerate(unique_plans):
+                plan_cookies = cookiefile if with_cookies else None
                 opts = _ytdlp_download_opts(
                     settings,
                     output_dir,
-                    cookiefile=cookiefile,
+                    cookiefile=plan_cookies,
                     player_clients=clients,
+                    force_no_cookies=not with_cookies,
                 )
                 log.info(
-                    "yt-dlp player clients for %s: %s",
+                    "yt-dlp player clients for %s: %s (%s)",
                     video.youtube_video_id,
                     ",".join(clients),
+                    "cookies" if plan_cookies else "no-cookies",
                 )
                 for attempt in range(1, attempts + 1):
                     try:
                         filepath = _ytdlp_fetch_file(
-                            opts, video, output_dir, min_height=min_h
+                            opts,
+                            video,
+                            output_dir,
+                            min_height=min_h,
+                            page_url=download_url,
                         )
-                        # Prefer HD success; drop any lower-res candidate.
                         if best_path and best_path.exists() and best_path != filepath:
                             best_path.unlink(missing_ok=True)
                         DOWNLOAD_GUARD.release(ok=True)
@@ -356,7 +379,6 @@ def download_video(settings: Settings, video: Video, output_dir: Path) -> Path:
                         return filepath
                     except LowResolutionError as exc:
                         last_error = exc
-                        # Keep the best usable file; do not delete until a better one lands.
                         if exc.path and exc.path.exists():
                             h = exc.height or 0
                             if h > best_height:
@@ -375,7 +397,7 @@ def download_video(settings: Settings, video: Video, output_dir: Path) -> Path:
                                 )
                             elif exc.path != best_path:
                                 exc.path.unlink(missing_ok=True)
-                        break  # next client plan (no point re-downloading same clients)
+                        break
                     except Exception as exc:
                         last_error = exc
                         if is_youtube_bot_check(exc):
@@ -384,33 +406,41 @@ def download_video(settings: Settings, video: Video, output_dir: Path) -> Path:
                             DOWNLOAD_GUARD.trip_bot_check(
                                 settings, video_id=video.youtube_video_id
                             )
-                            # Cool down / rotate, then retry outer while with new cookies.
                             rate_limited = True
                             break
                         if is_youtube_rate_limited(exc):
                             rate_limited = True
                             break
                         message = str(exc).lower()
-                        # These mean this client stack can't serve video — switch plan.
-                        switch_plan = any(
+                        is_403 = "403" in message or "forbidden" in message
+                        switch_plan = is_403 or any(
                             token in message
                             for token in (
                                 "requested format is not available",
                                 "only images are available",
                                 "format is not available",
-                                "http error 403",
-                                "403: forbidden",
                                 "fragment not found",
                                 "unable to download",
                             )
                         )
                         if switch_plan:
-                            log.warning(
-                                "Client plan failed for %s (%s); trying next plan",
-                                video.youtube_video_id,
-                                str(exc)[:300],
-                            )
-                            # Drop incomplete HLS leftovers; keep any prior best candidate.
+                            if is_403:
+                                cdn_403_plans += 1
+                                log.warning(
+                                    "CDN/PO-token 403 for %s with %s — "
+                                    "googlevideo rejected the stream URL "
+                                    "(plan %s/%s). bgutil :4416 down? cookies stale?",
+                                    video.youtube_video_id,
+                                    ",".join(clients),
+                                    plan_i + 1,
+                                    len(unique_plans),
+                                )
+                            else:
+                                log.warning(
+                                    "Client plan failed for %s (%s); trying next plan",
+                                    video.youtube_video_id,
+                                    str(exc)[:300],
+                                )
                             protected = (
                                 {best_path.resolve()}
                                 if best_path is not None and best_path.exists()
@@ -433,15 +463,10 @@ def download_video(settings: Settings, video: Video, output_dir: Path) -> Path:
                             break
                         retryable = any(
                             token in message
-                            for token in (
-                                "403",
-                                "forbidden",
-                                "timed out",
-                                "timeout",
-                            )
+                            for token in ("timed out", "timeout")
                         )
                         if attempt >= attempts or not retryable:
-                            break  # try next plan instead of aborting whole download
+                            break
                         sleep_for = min(2 ** attempt, 45)
                         log.warning(
                             "Download attempt %s/%s failed for %s (%s). Retrying in %ss...",
@@ -455,7 +480,6 @@ def download_video(settings: Settings, video: Video, output_dir: Path) -> Path:
                 if rate_limited:
                     break
 
-            # No plan met YTDLP_MIN_HEIGHT — accept best usable download if we have one.
             if not rate_limited and best_path is not None and best_path.exists():
                 log.warning(
                     "Accepting best available %sp for %s (wanted >=%sp). "
@@ -468,14 +492,28 @@ def download_video(settings: Settings, video: Video, output_dir: Path) -> Path:
                 released = True
                 return best_path
 
+            # All cookie plans CDN-403'd → rotate account and retry the video.
+            if (
+                not rate_limited
+                and cdn_403_plans >= 2
+                and cookiefile is not None
+            ):
+                DOWNLOAD_GUARD.release(ok=False)
+                released = True
+                log.error(
+                    "Repeated googlevideo 403 for %s — rotating cookies / short cooldown",
+                    video.youtube_video_id,
+                )
+                DOWNLOAD_GUARD.trip_bot_check(
+                    settings, video_id=video.youtube_video_id
+                )
+                continue
+
             if rate_limited:
                 if not released:
                     DOWNLOAD_GUARD.release(ok=False)
                     released = True
-                if is_youtube_bot_check(last_error or ""):
-                    # trip_bot_check already raised or set cooldown
-                    pass
-                elif last_error and is_youtube_rate_limited(last_error):
+                if last_error and is_youtube_rate_limited(last_error):
                     DOWNLOAD_GUARD.trip_rate_limit(
                         settings, video_id=video.youtube_video_id
                     )
@@ -492,11 +530,13 @@ def _ytdlp_fetch_file(
     output_dir: Path,
     *,
     min_height: int = 0,
+    page_url: str | None = None,
 ) -> Path:
     """Run one yt-dlp download and return the local file path."""
+    url = page_url or _watch_url(video.youtube_video_id)
     with YoutubeDL(opts) as ydl:
         # Single extract+download (match_filter rejects live).
-        info = ydl.extract_info(video.url, download=True)
+        info = ydl.extract_info(url, download=True)
         if not info:
             raise RuntimeError("yt-dlp returned no info after download")
 
@@ -506,13 +546,20 @@ def _ytdlp_fetch_file(
                 (fmt.get("height") or 0 for fmt in info["requested_formats"]),
                 default=0,
             ) or None
-        format_id = info.get("format_id") or "unknown"
+        format_id = str(info.get("format_id") or "unknown")
         log.info(
             "Selected format %s (%s) for %s",
             format_id,
             f"{height}p" if height else (info.get("resolution") or "unknown"),
             video.youtube_video_id,
         )
+        if format_id == "18" or (height is not None and height <= 360):
+            log.warning(
+                "Only low-quality format %s for %s — higher formats are blocked "
+                "(PO token / SABR). If download 403s, refresh cookies or update yt-dlp.",
+                format_id,
+                video.youtube_video_id,
+            )
 
         requested = info.get("requested_downloads") or []
         filepath = None
