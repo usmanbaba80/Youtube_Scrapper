@@ -169,9 +169,10 @@ def _player_clients(settings: Settings, *, use_cookies: bool) -> list[str]:
     """
     Pick YouTube Innertube clients that still expose HD formats.
 
-    Prefer ``mweb`` / ``web`` / ``tv`` (HTTPS). Put ``web_safari`` last — HLS
-    often 403s. Cookie accounts can still get CDN 403 on format 18 when the
-    GVS PO token is bad; a later cookie-less ios/tv plan may work.
+    Avoid leading with ``mweb``/``web`` when a GVS PO Token provider is not
+    configured — those clients then advertise only progressive format 18
+    (~360p). ``web_safari`` + ``tv`` + ``web_embedded`` (yt-dlp defaults)
+    still return DASH up to 1080p with cookies.
     """
     raw = (settings.ytdlp_player_clients or "").strip()
     if raw:
@@ -180,8 +181,8 @@ def _player_clients(settings: Settings, *, use_cookies: bool) -> list[str]:
         settings.cookies_file or settings.cookies_dir or settings.cookies_from_browser
     )
     if cookie_mode:
-        return ["mweb", "web", "tv", "web_safari"]
-    return ["ios", "tv", "mweb", "web"]
+        return ["web_safari", "tv", "web_embedded"]
+    return ["ios", "tv", "tv_simply", "web_embedded"]
 
 
 def _ytdlp_download_opts(
@@ -206,23 +207,32 @@ def _ytdlp_download_opts(
         )
 
     max_h = max(settings.ytdlp_max_height, 360)
+    # "1080p" = shorter side ≤ 1080. Portrait 1080p is 1080x1920 (long edge 1920).
+    long_edge = max(max_h, (max_h * 16 + 8) // 9)
     audio = _prefer_english_audio()
     format_selector = settings.ytdlp_format
     if format_selector == "bv*+ba/b":
         prefer = min(max_h, 1080)
-        # Prefer HTTPS/DASH over HLS (m3u8). web_safari HLS often 403s fragments.
         https = "[protocol^=http][protocol!*=m3u8]" if prefer_https else ""
+        # Landscape: height is the short side. Portrait: width is the short side.
+        # Cap short side at max_h so we never pull 1440p/4K.
         format_selector = (
-            f"bv*{https}[height>={prefer}][height<=?{max_h}]+({audio})/"
-            f"bestvideo{https}[height>={prefer}][height<=?{max_h}]+({audio})/"
-            f"bv*{https}[height>=720][height<=?{max_h}]+({audio})/"
-            f"bestvideo{https}[height>=720][height<=?{max_h}]+({audio})/"
-            f"bv*{https}[height<=?{max_h}]+({audio})/"
-            f"b{https}[height>={prefer}][height<=?{max_h}]/"
-            f"b{https}[height>=720]/"
-            # Last resort: allow HLS if nothing else is offered.
+            # Prefer ~1080p landscape, then portrait.
+            f"bv*{https}[height>={prefer}][height<=?{max_h}][width<=?{long_edge}]+({audio})/"
+            f"bv*{https}[width>={prefer}][width<=?{max_h}][height<=?{long_edge}]+({audio})/"
+            # Prefer >=720p landscape / portrait within the 1080p cap.
+            f"bv*{https}[height>=720][height<=?{max_h}][width<=?{long_edge}]+({audio})/"
+            f"bv*{https}[width>=720][width<=?{max_h}][height<=?{long_edge}]+({audio})/"
+            # Best under the 1080p cap.
+            f"bv*{https}[height<=?{max_h}][width<=?{long_edge}]+({audio})/"
+            f"bv*{https}[width<=?{max_h}][height<=?{long_edge}]+({audio})/"
+            f"b{https}[height<=?{max_h}]/"
+            f"b{https}[width<=?{max_h}]/"
+            # HLS last resort (still capped).
             f"bv*[height>={prefer}][height<=?{max_h}]+({audio})/"
-            f"bv*[height>=720][height<=?{max_h}]+({audio})/"
+            f"bv*[width>={prefer}][width<=?{max_h}][height<=?{long_edge}]+({audio})/"
+            f"bv*[height<=?{max_h}]+({audio})/"
+            f"bv*[width<=?{max_h}][height<=?{long_edge}]+({audio})/"
             f"bv*+({audio})/b"
         )
 
@@ -236,8 +246,8 @@ def _ytdlp_download_opts(
 
     opts: dict = {
         "format": format_selector,
-        # Prefer HTTPS over HLS, then resolution.
-        "format_sort": ["proto:https", "res", "lang:en", "vbr", "abr", "size"],
+        # Prefer ~target resolution (short side), then HTTPS, then bitrate.
+        "format_sort": [f"res:{max_h}", "proto:https", "lang:en", "vbr", "abr", "size"],
         "format_sort_force": True,
         "merge_output_format": "mp4",
         "outtmpl": str(output_dir / "%(id)s.%(ext)s"),
@@ -298,6 +308,63 @@ class LowResolutionError(RuntimeError):
         )
 
 
+def _effective_height(info: dict) -> int | None:
+    """Quality 'p' = shorter side. Portrait 1080x1920 → 1080, not 1920."""
+    width = info.get("width")
+    height = info.get("height")
+    for fmt in info.get("requested_formats") or []:
+        if fmt.get("vcodec") and fmt.get("vcodec") != "none":
+            width = fmt.get("width") or width
+            height = fmt.get("height") or height
+            break
+    if width and height:
+        return min(int(width), int(height))
+    if height:
+        return int(height)
+    if width:
+        return int(width)
+    return None
+
+
+def _max_listed_height(info: dict) -> int:
+    """Highest short-edge among listed video formats (no download)."""
+    best = 0
+    for fmt in info.get("formats") or []:
+        vcodec = fmt.get("vcodec")
+        if not vcodec or vcodec == "none":
+            continue
+        if (fmt.get("protocol") or "").startswith("mhtml"):
+            continue
+        width = int(fmt.get("width") or 0)
+        height = int(fmt.get("height") or 0)
+        if width and height:
+            best = max(best, min(width, height))
+        elif height:
+            best = max(best, height)
+        elif width:
+            best = max(best, width)
+    selected = _effective_height(info) or 0
+    return max(best, selected)
+
+
+def _ytdlp_probe_max_height(
+    opts: dict,
+    *,
+    page_url: str,
+) -> int:
+    """List formats only (no media download). Returns best short-edge height."""
+    probe_opts = dict(opts)
+    probe_opts["skip_download"] = True
+    # No pre-download sleep when we are only listing formats.
+    probe_opts["sleep_interval"] = 0
+    probe_opts["max_sleep_interval"] = 0
+    with YoutubeDL(probe_opts) as ydl:
+        info = ydl.extract_info(page_url, download=False)
+    if not info:
+        raise RuntimeError("yt-dlp returned no info while listing formats")
+    return _max_listed_height(info)
+
+
 def download_video(settings: Settings, video: Video, output_dir: Path) -> Path:
     output_dir.mkdir(parents=True, exist_ok=True)
     DOWNLOAD_GUARD.configure(settings)
@@ -323,13 +390,13 @@ def download_video(settings: Settings, video: Video, output_dir: Path) -> Path:
             )
 
         # Each plan: (clients, use_cookie_file).
-        # After the first cookie 403, try guest ios/tv immediately — logged-in
-        # sessions often get googlevideo 403 on format 18 while guest still works.
+        # Skip mweb/web-first plans without a PO Token provider — they only
+        # yield format 18. Fall back to guest ios/tv if cookie clients 403.
         plan_specs: list[tuple[list[str], bool]] = [
             (_player_clients(settings, use_cookies=use_cookies), True),
+            (["web_safari", "tv", "web_embedded"], True),
             (["ios", "tv", "tv_simply"], False),
-            (["mweb", "tv", "web"], True),
-            (["tv", "web"], True),
+            (["tv", "web_embedded"], True),
         ]
         seen_plans: set[tuple[str, ...]] = set()
         unique_plans: list[tuple[list[str], bool]] = []
@@ -342,12 +409,13 @@ def download_video(settings: Settings, video: Video, output_dir: Path) -> Path:
             seen_plans.add(key)
             unique_plans.append((clients, with_cookies))
 
-        best_path: Path | None = None
-        best_height = -1
         released = False
         cdn_403_plans = 0
         try:
             rate_limited = False
+            # Phase 1: list formats per client plan (no media download).
+            best_plan: tuple[list[str], bool, int] | None = None
+            best_probe_height = -1
             for plan_i, (clients, with_cookies) in enumerate(unique_plans):
                 plan_cookies = cookiefile if with_cookies else None
                 opts = _ytdlp_download_opts(
@@ -357,146 +425,185 @@ def download_video(settings: Settings, video: Video, output_dir: Path) -> Path:
                     player_clients=clients,
                     force_no_cookies=not with_cookies,
                 )
+                cookie_mode = (
+                    "cookies"
+                    if with_cookies
+                    and (
+                        plan_cookies
+                        or settings.cookies_file
+                        or settings.cookies_from_browser
+                    )
+                    else "no-cookies"
+                )
                 log.info(
-                    "yt-dlp player clients for %s: %s (%s)",
+                    "Format probe for %s: %s (%s) plan %s/%s",
                     video.youtube_video_id,
                     ",".join(clients),
-                    "cookies" if plan_cookies else "no-cookies",
+                    cookie_mode,
+                    plan_i + 1,
+                    len(unique_plans),
                 )
-                for attempt in range(1, attempts + 1):
-                    try:
-                        filepath = _ytdlp_fetch_file(
-                            opts,
-                            video,
-                            output_dir,
-                            min_height=min_h,
-                            page_url=download_url,
-                        )
-                        if best_path and best_path.exists() and best_path != filepath:
-                            best_path.unlink(missing_ok=True)
-                        DOWNLOAD_GUARD.release(ok=True)
+                try:
+                    listed_h = _ytdlp_probe_max_height(opts, page_url=download_url)
+                except Exception as exc:
+                    last_error = exc
+                    if is_youtube_bot_check(exc):
+                        DOWNLOAD_GUARD.release(ok=False)
                         released = True
-                        return filepath
-                    except LowResolutionError as exc:
-                        last_error = exc
-                        if exc.path and exc.path.exists():
-                            h = exc.height or 0
-                            if h > best_height:
-                                if best_path and best_path != exc.path and best_path.exists():
-                                    best_path.unlink(missing_ok=True)
-                                best_path = exc.path
-                                best_height = h
-                                log.warning(
-                                    "Keeping %sp candidate for %s; trying other clients "
-                                    "for >=%sp (plan %s/%s)",
-                                    h,
-                                    video.youtube_video_id,
-                                    min_h,
-                                    plan_i + 1,
-                                    len(unique_plans),
-                                )
-                            elif exc.path != best_path:
-                                exc.path.unlink(missing_ok=True)
+                        DOWNLOAD_GUARD.trip_bot_check(
+                            settings, video_id=video.youtube_video_id
+                        )
+                        rate_limited = True
                         break
-                    except Exception as exc:
-                        last_error = exc
-                        if is_youtube_bot_check(exc):
-                            DOWNLOAD_GUARD.release(ok=False)
-                            released = True
-                            DOWNLOAD_GUARD.trip_bot_check(
-                                settings, video_id=video.youtube_video_id
-                            )
-                            rate_limited = True
-                            break
-                        if is_youtube_rate_limited(exc):
-                            rate_limited = True
-                            break
-                        message = str(exc).lower()
-                        is_403 = "403" in message or "forbidden" in message
-                        switch_plan = is_403 or any(
-                            token in message
-                            for token in (
-                                "requested format is not available",
-                                "only images are available",
-                                "format is not available",
-                                "fragment not found",
-                                "unable to download",
-                            )
-                        )
-                        if switch_plan:
-                            if is_403:
-                                cdn_403_plans += 1
-                                log.warning(
-                                    "CDN/PO-token 403 for %s with %s — "
-                                    "googlevideo rejected the stream URL "
-                                    "(plan %s/%s). bgutil :4416 down? cookies stale?",
-                                    video.youtube_video_id,
-                                    ",".join(clients),
-                                    plan_i + 1,
-                                    len(unique_plans),
-                                )
-                            else:
-                                log.warning(
-                                    "Client plan failed for %s (%s); trying next plan",
-                                    video.youtube_video_id,
-                                    str(exc)[:300],
-                                )
-                            protected = (
-                                {best_path.resolve()}
-                                if best_path is not None and best_path.exists()
-                                else set()
-                            )
-                            for partial in output_dir.glob(f"{video.youtube_video_id}*"):
-                                try:
-                                    if partial.resolve() in protected:
-                                        continue
-                                except OSError:
-                                    continue
-                                if partial.suffix.lower() in {
-                                    ".part",
-                                    ".ytdl",
-                                    ".mp4",
-                                    ".m4a",
-                                    ".webm",
-                                }:
-                                    partial.unlink(missing_ok=True)
-                            break
-                        retryable = any(
-                            token in message
-                            for token in ("timed out", "timeout")
-                        )
-                        if attempt >= attempts or not retryable:
-                            break
-                        sleep_for = min(2 ** attempt, 45)
-                        log.warning(
-                            "Download attempt %s/%s failed for %s (%s). Retrying in %ss...",
-                            attempt,
-                            attempts,
-                            video.youtube_video_id,
-                            exc,
-                            sleep_for,
-                        )
-                        time.sleep(sleep_for)
-                if rate_limited:
+                    if is_youtube_rate_limited(exc):
+                        rate_limited = True
+                        break
+                    message = str(exc).lower()
+                    is_403 = "403" in message or "forbidden" in message
+                    if is_403:
+                        cdn_403_plans += 1
+                    log.warning(
+                        "Format probe failed for %s with %s (%s); trying next plan",
+                        video.youtube_video_id,
+                        ",".join(clients),
+                        str(exc)[:300],
+                    )
+                    continue
+
+                log.info(
+                    "Format probe %s: max listed %sp via %s",
+                    video.youtube_video_id,
+                    listed_h,
+                    ",".join(clients),
+                )
+                if listed_h > best_probe_height:
+                    best_probe_height = listed_h
+                    best_plan = (clients, with_cookies, listed_h)
+                # Found HD (or min target) — no need to probe further plans.
+                if min_h > 0 and listed_h >= min_h:
                     break
 
-            if not rate_limited and best_path is not None and best_path.exists():
-                log.warning(
-                    "Accepting best available %sp for %s (wanted >=%sp). "
-                    "Source/clients did not expose higher formats.",
-                    best_height if best_height > 0 else "?",
-                    video.youtube_video_id,
-                    min_h,
-                )
-                DOWNLOAD_GUARD.release(ok=True)
-                released = True
-                return best_path
+            if rate_limited:
+                if not released:
+                    DOWNLOAD_GUARD.release(ok=False)
+                    released = True
+                if last_error and is_youtube_rate_limited(last_error):
+                    DOWNLOAD_GUARD.trip_rate_limit(
+                        settings, video_id=video.youtube_video_id
+                    )
+                continue
 
-            # All cookie plans CDN-403'd → rotate account and retry the video.
+            if best_plan is None:
+                if (
+                    cdn_403_plans >= 2
+                    and cookiefile is not None
+                ):
+                    DOWNLOAD_GUARD.release(ok=False)
+                    released = True
+                    log.error(
+                        "Repeated googlevideo 403 for %s — rotating cookies / short cooldown",
+                        video.youtube_video_id,
+                    )
+                    DOWNLOAD_GUARD.trip_bot_check(
+                        settings, video_id=video.youtube_video_id
+                    )
+                    continue
+                raise RuntimeError(
+                    str(last_error) if last_error else "No formats listed for any client plan"
+                )
+
+            clients, with_cookies, listed_h = best_plan
+            if min_h > 0 and listed_h < min_h:
+                log.warning(
+                    "No client plan listed >=%sp for %s (best listed %sp). "
+                    "Downloading best available once.",
+                    min_h,
+                    video.youtube_video_id,
+                    listed_h,
+                )
+            else:
+                log.info(
+                    "Downloading %s once via %s (listed max %sp)",
+                    video.youtube_video_id,
+                    ",".join(clients),
+                    listed_h,
+                )
+
+            # Phase 2: single media download with the best plan.
+            plan_cookies = cookiefile if with_cookies else None
+            opts = _ytdlp_download_opts(
+                settings,
+                output_dir,
+                cookiefile=plan_cookies,
+                player_clients=clients,
+                force_no_cookies=not with_cookies,
+            )
+            for attempt in range(1, attempts + 1):
+                try:
+                    filepath = _ytdlp_fetch_file(
+                        opts,
+                        video,
+                        output_dir,
+                        min_height=0,  # soft: accept best after probing for HD
+                        page_url=download_url,
+                    )
+                    DOWNLOAD_GUARD.release(ok=True)
+                    released = True
+                    if min_h > 0 and listed_h < min_h:
+                        log.warning(
+                            "Accepting best available %sp for %s (wanted >=%sp). "
+                            "Source/clients did not expose higher formats.",
+                            listed_h,
+                            video.youtube_video_id,
+                            min_h,
+                        )
+                    return filepath
+                except Exception as exc:
+                    last_error = exc
+                    if is_youtube_bot_check(exc):
+                        DOWNLOAD_GUARD.release(ok=False)
+                        released = True
+                        DOWNLOAD_GUARD.trip_bot_check(
+                            settings, video_id=video.youtube_video_id
+                        )
+                        rate_limited = True
+                        break
+                    if is_youtube_rate_limited(exc):
+                        rate_limited = True
+                        break
+                    message = str(exc).lower()
+                    is_403 = "403" in message or "forbidden" in message
+                    retryable = is_403 or any(
+                        token in message for token in ("timed out", "timeout")
+                    )
+                    if attempt >= attempts or not retryable:
+                        break
+                    sleep_for = min(2 ** attempt, 45)
+                    log.warning(
+                        "Download attempt %s/%s failed for %s (%s). Retrying in %ss...",
+                        attempt,
+                        attempts,
+                        video.youtube_video_id,
+                        exc,
+                        sleep_for,
+                    )
+                    time.sleep(sleep_for)
+
+            if rate_limited:
+                if not released:
+                    DOWNLOAD_GUARD.release(ok=False)
+                    released = True
+                if last_error and is_youtube_rate_limited(last_error):
+                    DOWNLOAD_GUARD.trip_rate_limit(
+                        settings, video_id=video.youtube_video_id
+                    )
+                continue
+
             if (
-                not rate_limited
-                and cdn_403_plans >= 2
+                cdn_403_plans >= 2
                 and cookiefile is not None
+                and last_error
+                and ("403" in str(last_error).lower() or "forbidden" in str(last_error).lower())
             ):
                 DOWNLOAD_GUARD.release(ok=False)
                 released = True
@@ -509,15 +616,6 @@ def download_video(settings: Settings, video: Video, output_dir: Path) -> Path:
                 )
                 continue
 
-            if rate_limited:
-                if not released:
-                    DOWNLOAD_GUARD.release(ok=False)
-                    released = True
-                if last_error and is_youtube_rate_limited(last_error):
-                    DOWNLOAD_GUARD.trip_rate_limit(
-                        settings, video_id=video.youtube_video_id
-                    )
-                continue
             raise RuntimeError(str(last_error) if last_error else "Download failed")
         finally:
             if not released:
@@ -540,17 +638,23 @@ def _ytdlp_fetch_file(
         if not info:
             raise RuntimeError("yt-dlp returned no info after download")
 
-        height = info.get("height")
-        if not height and info.get("requested_formats"):
-            height = max(
-                (fmt.get("height") or 0 for fmt in info["requested_formats"]),
-                default=0,
-            ) or None
+        height = _effective_height(info)
         format_id = str(info.get("format_id") or "unknown")
+        resolution = info.get("resolution")
+        if not resolution:
+            w, h = info.get("width"), info.get("height")
+            if not (w and h):
+                for fmt in info.get("requested_formats") or []:
+                    if fmt.get("vcodec") and fmt.get("vcodec") != "none":
+                        w, h = fmt.get("width"), fmt.get("height")
+                        break
+            if w and h:
+                resolution = f"{w}x{h}"
         log.info(
-            "Selected format %s (%s) for %s",
+            "Selected format %s (%sp%s) for %s",
             format_id,
-            f"{height}p" if height else (info.get("resolution") or "unknown"),
+            height or "?",
+            f", {resolution}" if resolution else "",
             video.youtube_video_id,
         )
         if format_id == "18" or (height is not None and height <= 360):
