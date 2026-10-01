@@ -256,6 +256,44 @@ class BunnyStream:
             )
         return response.json() or {}
 
+    def list_videos(
+        self,
+        *,
+        collection_id: str | None = None,
+        items_per_page: int = 100,
+    ) -> list[dict]:
+        """Paginate all Stream videos, optionally filtered to one collection."""
+        page = 1
+        out: list[dict] = []
+        while True:
+            params: dict = {
+                "page": page,
+                "itemsPerPage": items_per_page,
+                "orderBy": "date",
+            }
+            if collection_id:
+                params["collection"] = collection_id
+            response = self.session.get(
+                self._url("videos"),
+                params=params,
+                timeout=120,
+            )
+            if response.status_code != 200:
+                raise RuntimeError(
+                    f"List Stream videos failed ({response.status_code}): "
+                    f"{response.text[:500]}"
+                )
+            payload = response.json() or {}
+            items = payload.get("items") or payload.get("Items") or []
+            out.extend(items)
+            total_items = int(
+                payload.get("totalItems") or payload.get("TotalItems") or 0
+            )
+            if page * items_per_page >= total_items or not items:
+                break
+            page += 1
+        return out
+
     def delete_video(self, video_id: str) -> None:
         """Best-effort delete of a Stream video (used to clean up failed uploads)."""
         if not video_id:

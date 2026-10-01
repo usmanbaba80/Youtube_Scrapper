@@ -13,8 +13,14 @@ from app.models import Category, Creator, Playlist, PlaylistItem, Short, Video
 from app.scraper import scrape_all_creators
 from app.thumbnails import transfer_thumbnails
 from app.transfer import download_videos, transfer_videos, upload_videos
+from app.reconcile_bunny import reconcile_bunny
 
 log = logging.getLogger(__name__)
+
+
+def run_reconcile_bunny(session: Session, settings: Settings, **kwargs) -> None:
+    stats = reconcile_bunny(session, settings, **kwargs)
+    log.info("Reconcile Bunny summary: %s", stats)
 
 
 def run_export_json(session: Session, settings: Settings, **kwargs) -> None:

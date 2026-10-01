@@ -15,6 +15,7 @@ from app.pipeline import (
     run_export_json,
     run_load_excel,
     run_metadata,
+    run_reconcile_bunny,
     run_scrape,
     run_thumbnails,
     run_transfer,
@@ -50,6 +51,7 @@ def build_parser() -> argparse.ArgumentParser:
             "upload",
             "transfer",
             "thumbnails",
+            "reconcile-bunny",
             "export-json",
             "run",
             "status",
@@ -92,6 +94,11 @@ def build_parser() -> argparse.ArgumentParser:
             "re-upload thumbnails even if already present"
         ),
     )
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="For reconcile-bunny: list matches / duplicate deletes without changing DB or Bunny",
+    )
     return parser
 
 
@@ -114,10 +121,11 @@ def main() -> None:
         "scrape",
         "transfer",
         "thumbnails",
+        "reconcile-bunny",
         "run",
     }:
         print(
-            "error: --media is only supported for scrape, transfer, thumbnails, and run",
+            "error: --media is only supported for scrape, transfer, thumbnails, reconcile-bunny, and run",
             file=sys.stderr,
         )
         raise SystemExit(2)
@@ -182,6 +190,14 @@ def main() -> None:
                 media_types=media_types,
                 retry_failed=args.retry_failed,
                 force=args.force,
+            )
+        elif args.command == "reconcile-bunny":
+            run_reconcile_bunny(
+                session,
+                settings,
+                channel_ids=channel_ids,
+                media_types=media_types,
+                dry_run=args.dry_run,
             )
         elif args.command == "export-json":
             out = args.output_dir
