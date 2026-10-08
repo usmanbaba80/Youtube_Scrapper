@@ -447,6 +447,26 @@ def download_video(settings: Settings, video: Video, output_dir: Path) -> Path:
                     listed_h = _ytdlp_probe_max_height(opts, page_url=download_url)
                 except Exception as exc:
                     last_error = exc
+                    guest_blocked = not with_cookies and (
+                        is_youtube_bot_check(exc) or is_youtube_rate_limited(exc)
+                    )
+                    if guest_blocked:
+                        # Guest ios/tv probes are sent without cookies and often
+                        # bot-check. That must not abort the queue: keep the
+                        # cookie plan's formats, or try the next cookie plan.
+                        if best_plan is not None:
+                            log.warning(
+                                "Anonymous format probe blocked for %s; "
+                                "keeping cookie probe result %sp (skip remaining plans)",
+                                video.youtube_video_id,
+                                best_probe_height,
+                            )
+                            break
+                        log.warning(
+                            "Anonymous format probe blocked for %s; skipping guest plan",
+                            video.youtube_video_id,
+                        )
+                        continue
                     if is_youtube_bot_check(exc):
                         DOWNLOAD_GUARD.release(ok=False)
                         released = True
@@ -481,6 +501,16 @@ def download_video(settings: Settings, video: Video, output_dir: Path) -> Path:
                     best_plan = (clients, with_cookies, listed_h)
                 # Found HD (or min target) — no need to probe further plans.
                 if min_h > 0 and listed_h >= min_h:
+                    break
+                # Cookies already returned real formats; skip guest plans that
+                # often only trigger bot-check and abort the transfer queue.
+                if with_cookies and listed_h > 360:
+                    log.info(
+                        "Cookie plan listed %sp for %s — skipping anonymous "
+                        "client probes to avoid bot-check abort",
+                        listed_h,
+                        video.youtube_video_id,
+                    )
                     break
 
             if rate_limited:
