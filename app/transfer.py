@@ -169,10 +169,10 @@ def _player_clients(settings: Settings, *, use_cookies: bool) -> list[str]:
     """
     Pick YouTube Innertube clients that still expose HD formats.
 
-    Avoid leading with ``mweb``/``web`` when a GVS PO Token provider is not
-    configured — those clients then advertise only progressive format 18
-    (~360p). ``web_safari`` + ``tv`` + ``web_embedded`` (yt-dlp defaults)
-    still return DASH up to 1080p with cookies.
+    yt-dlp 2026.08 defaults: logged-in ``web_embedded,tv_downgraded,web`` and
+    guest ``visionos,web``. Older ``web_safari`` / ``tv`` / ``ios`` /
+    ``tv_simply`` plans now come back as "Video unavailable" or
+    "This content isn't available" even when the video is public.
     """
     raw = (settings.ytdlp_player_clients or "").strip()
     if raw:
@@ -181,8 +181,8 @@ def _player_clients(settings: Settings, *, use_cookies: bool) -> list[str]:
         settings.cookies_file or settings.cookies_dir or settings.cookies_from_browser
     )
     if cookie_mode:
-        return ["web_safari", "tv", "web_embedded"]
-    return ["ios", "tv", "tv_simply", "web_embedded"]
+        return ["web_embedded", "tv_downgraded", "web"]
+    return ["visionos", "web"]
 
 
 def _ytdlp_download_opts(
@@ -390,13 +390,15 @@ def download_video(settings: Settings, video: Video, output_dir: Path) -> Path:
             )
 
         # Each plan: (clients, use_cookie_file).
-        # Skip mweb/web-first plans without a PO Token provider — they only
-        # yield format 18. Fall back to guest ios/tv if cookie clients 403.
+        # Cookie plan matches yt-dlp's logged-in defaults. Guest visionos/web
+        # is the fallback when those clients are rejected. Do not retry the
+        # pre-2026.08 web_safari/tv/ios set — YouTube answers those with
+        # "Video unavailable" for videos that are still public.
         plan_specs: list[tuple[list[str], bool]] = [
             (_player_clients(settings, use_cookies=use_cookies), True),
-            (["web_safari", "tv", "web_embedded"], True),
-            (["ios", "tv", "tv_simply"], False),
-            (["tv", "web_embedded"], True),
+            (["web_embedded", "tv_downgraded", "web"], True),
+            (["visionos", "web"], False),
+            (["web_embedded", "tv_downgraded"], True),
         ]
         seen_plans: set[tuple[str, ...]] = set()
         unique_plans: list[tuple[list[str], bool]] = []

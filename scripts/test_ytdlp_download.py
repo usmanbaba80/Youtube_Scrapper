@@ -27,7 +27,7 @@ def main() -> int:
     parser.add_argument("--no-cookies", action="store_true")
     parser.add_argument(
         "--clients",
-        default="ios,tv,tv_simply",
+        default="web_embedded,tv_downgraded,web",
         help="Comma-separated player clients",
     )
     args = parser.parse_args()

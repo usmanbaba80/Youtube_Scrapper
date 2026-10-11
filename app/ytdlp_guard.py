@@ -13,27 +13,34 @@ _RATE_LIMIT_MARKERS = (
     "rate-limited",
     "rate limited",
     "try again later",
-    "this content isn't available",
     "http error 429",
     "too many requests",
 )
 
 
 _BOT_CHECK_MARKERS = (
-    "sign in to confirm you’re not a bot",
     "sign in to confirm you're not a bot",
     "confirm you're not a bot",
-    "confirm you’re not a bot",
 )
 
 
+def _yt_error_text(exc: BaseException | str) -> str:
+    """Lowercase and fold YouTube's curly apostrophes so markers match."""
+    return (
+        str(exc)
+        .lower()
+        .replace("\u2019", "'")
+        .replace("\u2018", "'")
+    )
+
+
 def is_youtube_rate_limited(exc: BaseException | str) -> bool:
-    text = str(exc).lower()
+    text = _yt_error_text(exc)
     return any(token in text for token in _RATE_LIMIT_MARKERS)
 
 
 def is_youtube_bot_check(exc: BaseException | str) -> bool:
-    text = str(exc).lower()
+    text = _yt_error_text(exc)
     return any(token in text for token in _BOT_CHECK_MARKERS)
 
 

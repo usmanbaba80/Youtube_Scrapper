@@ -147,7 +147,8 @@ def load_settings() -> Settings:
         ytdlp_max_height=_env_height("YTDLP_MAX_HEIGHT", 1080),
         # Reject downloads below this height and retry other clients (0 = allow any).
         ytdlp_min_height=_env_height("YTDLP_MIN_HEIGHT", 720),
-        # Comma-separated override, e.g. web_safari,mweb,web
+        # Comma-separated override. Empty uses web_embedded,tv_downgraded,web
+        # with cookies, and visionos,web without.
         ytdlp_player_clients=_env("YTDLP_PLAYER_CLIENTS"),
         ytdlp_js_runtimes=_env("YTDLP_JS_RUNTIMES"),
         # yt-dlp built-in pauses (seconds). Cuts account-level rate limits.
