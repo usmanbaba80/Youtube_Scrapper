@@ -19,6 +19,8 @@ sys.path.insert(0, str(ROOT))
 
 from yt_dlp import YoutubeDL
 
+from app.config import load_settings, youtube_proxy_label
+
 
 def main() -> int:
     parser = argparse.ArgumentParser()
@@ -61,9 +63,16 @@ def main() -> int:
             else:
                 print("WARNING: no cookies found; continuing without")
 
+    settings = load_settings()
+    if settings.youtube_proxy:
+        opts["proxy"] = settings.youtube_proxy
     print("URL:", url)
     print("Clients:", clients)
     print("Cookies:", opts.get("cookiefile") or "(none)")
+    print(
+        "Proxy:",
+        youtube_proxy_label(settings.youtube_proxy) if settings.youtube_proxy else "(none)",
+    )
     try:
         with YoutubeDL(opts) as ydl:
             info = ydl.extract_info(url, download=True)

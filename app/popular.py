@@ -172,6 +172,12 @@ def _session() -> requests.Session:
             "Accept-Language": "en-US,en;q=0.9",
         }
     )
+    # Channel pages only. Does not change Bunny, Postgres, or other processes.
+    from app.config import youtube_proxy_url
+
+    proxy = youtube_proxy_url()
+    if proxy:
+        session.proxies.update({"http": proxy, "https": proxy})
     return session
 
 

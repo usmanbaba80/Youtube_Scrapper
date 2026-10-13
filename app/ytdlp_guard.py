@@ -44,6 +44,16 @@ def is_youtube_bot_check(exc: BaseException | str) -> bool:
     return any(token in text for token in _BOT_CHECK_MARKERS)
 
 
+def is_youtube_unavailable(exc: BaseException | str) -> bool:
+    """Player clients rejected the video. Also used for a dead cookie session."""
+    text = _yt_error_text(exc)
+    return (
+        "video unavailable" in text
+        or "this content isn't available" in text
+        or "the page needs to be reloaded" in text
+    )
+
+
 class RateLimitAbort(RuntimeError):
     """Raised when cooldowns/cookie rotations are exhausted — stop the transfer run."""
 
@@ -191,6 +201,13 @@ class YoutubeDownloadGuard:
     def has_cookies(self) -> bool:
         with self._lock:
             return bool(self._cookies and self._cookies.size)
+
+    def abort_run(self, reason: str) -> None:
+        """Stop this transfer run. Remaining rows stay pending."""
+        with self._lock:
+            self._abort = True
+            self._abort_reason = reason
+        raise RateLimitAbort(reason)
 
     def trip_bot_check(self, settings, *, video_id: str) -> None:
         """

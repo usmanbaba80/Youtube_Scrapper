@@ -47,11 +47,21 @@ def _guess_ext(url: str, content_type: str | None) -> str:
     return "jpg"
 
 
-def _download_thumbnail(url: str) -> tuple[bytes, str]:
+def _download_thumbnail(url: str, settings: Settings) -> tuple[bytes, str]:
+    proxies = None
+    host = (urlparse(url).hostname or "").lower()
+    if settings.youtube_proxy and (
+        host.endswith("youtube.com")
+        or host.endswith("ytimg.com")
+        or host.endswith("ggpht.com")
+        or host.endswith("googlevideo.com")
+    ):
+        proxies = {"http": settings.youtube_proxy, "https": settings.youtube_proxy}
     response = requests.get(
         url,
         timeout=60,
         headers={"User-Agent": "Mozilla/5.0 (compatible; YouTubeScraper/1.0)"},
+        proxies=proxies,
     )
     response.raise_for_status()
     data = response.content
@@ -85,7 +95,7 @@ def upload_thumbnail_from_url(
     source_url: str,
 ) -> dict[str, str]:
     storage = BunnyStorage(settings)
-    data, ext = _download_thumbnail(source_url)
+    data, ext = _download_thumbnail(source_url, settings)
     content_type = {
         "jpg": "image/jpeg",
         "png": "image/png",

@@ -4,7 +4,7 @@ import os
 from dataclasses import dataclass
 from pathlib import Path
 
-from urllib.parse import unquote
+from urllib.parse import quote, unquote, urlparse
 
 from dotenv import load_dotenv
 
@@ -98,6 +98,8 @@ class Settings:
     rate_limit_cooldown_seconds: float
     rate_limit_max_cooldowns: int
     logs_dir: Path
+    # SOCKS URL for YouTube traffic only. Empty means a direct connection.
+    youtube_proxy: str
 
 
 def load_settings() -> Settings:
@@ -166,4 +168,44 @@ def load_settings() -> Settings:
         # How many cooldown+cookie-rotate cycles before aborting the run.
         rate_limit_max_cooldowns=max(1, _env_int("RATE_LIMIT_MAX_COOLDOWNS", 3)),
         logs_dir=PROJECT_ROOT / "logs",
+        youtube_proxy=youtube_proxy_url(),
     )
+
+
+def youtube_proxy_url() -> str:
+    """
+    Proxy used only by this app's YouTube calls.
+
+    A full YTDLP_PROXY wins. Otherwise build a NordVPN SOCKS5 URL from
+    service credentials. Nothing is returned until host, username, and
+    password are all set, so the server IP stays in use until then.
+    """
+    explicit = _env("YTDLP_PROXY")
+    if explicit:
+        return explicit
+
+    host = _env("NORDVPN_SOCKS_HOST")
+    user = _env("NORDVPN_SOCKS_USER")
+    password = _env("NORDVPN_SOCKS_PASSWORD")
+    if not (host and user and password):
+        return ""
+
+    host = host.removeprefix("socks5h://").removeprefix("socks5://").strip("/")
+    if host.startswith("http://") or host.startswith("https://"):
+        return ""
+    port = _env("NORDVPN_SOCKS_PORT") or "1080"
+    # socks5h resolves YouTube's hostname at the proxy, not on this server.
+    return (
+        f"socks5h://{quote(user, safe='')}:{quote(password, safe='')}"
+        f"@{host}:{port}"
+    )
+
+
+def youtube_proxy_label(proxy_url: str) -> str:
+    """Host:port only, so logs never include the service password."""
+    parsed = urlparse(proxy_url)
+    if not parsed.hostname:
+        return "configured proxy"
+    if parsed.port:
+        return f"{parsed.hostname}:{parsed.port}"
+    return parsed.hostname

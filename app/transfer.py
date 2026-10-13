@@ -19,7 +19,7 @@ from app.bunny import (
     FOLDER_VIDEOS,
     BunnyStream,
 )
-from app.config import Settings
+from app.config import Settings, youtube_proxy_label
 from app.models import Creator, PlaylistItem, Short, Video
 from app.thumbnails import (
     transfer_playlist_thumbnails,
@@ -36,6 +36,7 @@ from app.ytdlp_guard import (
     DOWNLOAD_GUARD,
     RateLimitAbort,
     is_youtube_rate_limited,
+    is_youtube_unavailable,
 )
 
 try:
@@ -47,6 +48,7 @@ except ImportError:  # older ytdlp_guard.py on another machine
         return "confirm you" in text and "not a bot" in text
 
 log = logging.getLogger(__name__)
+_proxy_logged = False
 
 
 def _upload_one_file(
@@ -293,7 +295,32 @@ def _ytdlp_download_opts(
         opts["cookiefile"] = str(settings.cookies_file)
     elif settings.cookies_from_browser:
         opts["cookiesfrombrowser"] = (settings.cookies_from_browser,)
+    global _proxy_logged
+    if settings.youtube_proxy:
+        # yt-dlp only. Bunny uploads and Postgres stay on the server IP.
+        opts["proxy"] = settings.youtube_proxy
+        if not _proxy_logged:
+            log.info(
+                "YouTube download proxy %s (this project only)",
+                youtube_proxy_label(settings.youtube_proxy),
+            )
+            _proxy_logged = True
+    elif not _proxy_logged and _nordvpn_host_without_credentials():
+        log.error(
+            "NORDVPN_SOCKS_HOST is set but NORDVPN_SOCKS_USER / "
+            "NORDVPN_SOCKS_PASSWORD are empty. YouTube is still using the server IP."
+        )
+        _proxy_logged = True
     return opts
+
+
+def _nordvpn_host_without_credentials() -> bool:
+    import os
+
+    host = (os.getenv("NORDVPN_SOCKS_HOST") or "").strip()
+    user = (os.getenv("NORDVPN_SOCKS_USER") or "").strip()
+    password = (os.getenv("NORDVPN_SOCKS_PASSWORD") or "").strip()
+    return bool(host) and not (user and password)
 
 
 class LowResolutionError(RuntimeError):
@@ -390,13 +417,15 @@ def download_video(settings: Settings, video: Video, output_dir: Path) -> Path:
             )
 
         # Each plan: (clients, use_cookie_file).
-        # Cookie plan matches yt-dlp's logged-in defaults. Guest visionos/web
-        # is the fallback when those clients are rejected. Do not retry the
-        # pre-2026.08 web_safari/tv/ios set — YouTube answers those with
-        # "Video unavailable" for videos that are still public.
+        # Logged-in web/tv_downgraded often answer "Video unavailable" once
+        # cookies have been rotated. web_embedded without cookies still lists
+        # 1080p and does not need a PO token. visionos/web is the guest
+        # fallback; a bot-check there plus unavailable cookie plans means the
+        # session is dead, not that this one video is missing.
         plan_specs: list[tuple[list[str], bool]] = [
             (_player_clients(settings, use_cookies=use_cookies), True),
             (["web_embedded", "tv_downgraded", "web"], True),
+            (["web_embedded"], False),
             (["visionos", "web"], False),
             (["web_embedded", "tv_downgraded"], True),
         ]
@@ -418,6 +447,8 @@ def download_video(settings: Settings, video: Video, output_dir: Path) -> Path:
             # Phase 1: list formats per client plan (no media download).
             best_plan: tuple[list[str], bool, int] | None = None
             best_probe_height = -1
+            cookie_unavailable = False
+            guest_blocked = False
             for plan_i, (clients, with_cookies) in enumerate(unique_plans):
                 plan_cookies = cookiefile if with_cookies else None
                 opts = _ytdlp_download_opts(
@@ -449,10 +480,11 @@ def download_video(settings: Settings, video: Video, output_dir: Path) -> Path:
                     listed_h = _ytdlp_probe_max_height(opts, page_url=download_url)
                 except Exception as exc:
                     last_error = exc
-                    guest_blocked = not with_cookies and (
+                    anonymous_blocked = not with_cookies and (
                         is_youtube_bot_check(exc) or is_youtube_rate_limited(exc)
                     )
-                    if guest_blocked:
+                    if anonymous_blocked:
+                        guest_blocked = True
                         # Guest ios/tv probes are sent without cookies and often
                         # bot-check. That must not abort the queue: keep the
                         # cookie plan's formats, or try the next cookie plan.
@@ -484,6 +516,8 @@ def download_video(settings: Settings, video: Video, output_dir: Path) -> Path:
                     is_403 = "403" in message or "forbidden" in message
                     if is_403:
                         cdn_403_plans += 1
+                    if with_cookies and is_youtube_unavailable(exc):
+                        cookie_unavailable = True
                     log.warning(
                         "Format probe failed for %s with %s (%s); trying next plan",
                         video.youtube_video_id,
@@ -526,6 +560,20 @@ def download_video(settings: Settings, video: Video, output_dir: Path) -> Path:
                 continue
 
             if best_plan is None:
+                if cookie_unavailable and guest_blocked:
+                    if not released:
+                        DOWNLOAD_GUARD.release(ok=False)
+                        released = True
+                    DOWNLOAD_GUARD.abort_run(
+                        "YouTube blocked this downloader on "
+                        f"{video.youtube_video_id}: cookie clients returned "
+                        "'Video unavailable' and anonymous clients asked for "
+                        "sign-in. cookies.txt has been rotated or this IP is "
+                        "flagged. Export a fresh Netscape cookies.txt from a "
+                        "browser logged into YouTube on this same machine, "
+                        "replace YTDLP_COOKIES, and re-run. Remaining videos "
+                        "were left pending."
+                    )
                 if (
                     cdn_403_plans >= 2
                     and cookiefile is not None
