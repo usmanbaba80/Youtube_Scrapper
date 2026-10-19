@@ -98,6 +98,9 @@ class Settings:
     download_retries: int
     rate_limit_cooldown_seconds: float
     rate_limit_max_cooldowns: int
+    transfer_auto_restarts: int
+    transfer_restart_delay_seconds: float
+    transfer_same_video_host_fails: int
     logs_dir: Path
     # SOCKS URL for YouTube traffic only. Empty means a direct connection.
     youtube_proxy: str
@@ -168,6 +171,16 @@ def load_settings() -> Settings:
         ),
         # How many cooldown+cookie-rotate cycles before aborting the run.
         rate_limit_max_cooldowns=max(1, _env_int("RATE_LIMIT_MAX_COOLDOWNS", 3)),
+        # After a YouTube pause, transfer restarts itself this many times (0 = off).
+        transfer_auto_restarts=max(0, _env_int("TRANSFER_AUTO_RESTARTS", 24)),
+        # Pause before that restart when some videos already uploaded this pass.
+        transfer_restart_delay_seconds=float(
+            _env("TRANSFER_RESTART_DELAY_SECONDS") or "300"
+        ),
+        # Same video unavailable on every host this many times, then skip it.
+        transfer_same_video_host_fails=max(
+            1, _env_int("TRANSFER_SAME_VIDEO_HOST_FAILS", 2)
+        ),
         logs_dir=PROJECT_ROOT / "logs",
         youtube_proxy=youtube_proxy_url(),
     )
@@ -202,6 +215,10 @@ class _NordProxyPool:
                 return self._urls[0]
             self._index = (self._index + 1) % len(self._urls)
             return self._urls[self._index]
+
+    def reset(self) -> None:
+        with self._lock:
+            self._index = 0
 
 
 _PROXY_POOL: _NordProxyPool | None = None
@@ -246,6 +263,11 @@ def _proxy_pool() -> _NordProxyPool:
     if _PROXY_POOL is None:
         _PROXY_POOL = _NordProxyPool(_build_proxy_urls())
     return _PROXY_POOL
+
+
+def reset_youtube_proxy() -> None:
+    """Start the next transfer attempt on the first configured NordVPN exit."""
+    _proxy_pool().reset()
 
 
 def youtube_proxy_url() -> str:

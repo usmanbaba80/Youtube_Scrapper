@@ -34,6 +34,7 @@ from app.utils import (
 )
 from app.ytdlp_guard import (
     DOWNLOAD_GUARD,
+    HostsExhausted,
     RateLimitAbort,
     is_youtube_rate_limited,
     is_youtube_unavailable,
@@ -590,11 +591,21 @@ def download_video(settings: Settings, video: Video, output_dir: Path) -> Path:
                         released = True
                     if _switch_exit():
                         continue
+                    host_fails = DOWNLOAD_GUARD.note_hosts_exhausted(
+                        video.youtube_video_id
+                    )
+                    give_up = max(1, int(settings.transfer_same_video_host_fails))
+                    if host_fails >= give_up:
+                        raise HostsExhausted(
+                            "Video unavailable on every NordVPN host for "
+                            f"{video.youtube_video_id} ({host_fails} time(s)). "
+                            "Skipping this video and continuing the queue."
+                        )
                     DOWNLOAD_GUARD.abort_run(
                         "YouTube blocked every NordVPN exit on "
                         f"{video.youtube_video_id}: cookie clients returned "
                         "'Video unavailable' and anonymous clients asked for "
-                        "sign-in. Remaining videos were left pending."
+                        "sign-in. Pausing so the transfer can restart after a cooldown."
                     )
                 if (
                     cdn_403_plans >= 2
@@ -656,6 +667,7 @@ def download_video(settings: Settings, video: Video, output_dir: Path) -> Path:
                     )
                     DOWNLOAD_GUARD.release(ok=True)
                     released = True
+                    DOWNLOAD_GUARD.clear_host_failure(video.youtube_video_id)
                     if min_h > 0 and listed_h < min_h:
                         log.warning(
                             "Accepting best available %sp for %s (wanted >=%sp). "
@@ -1324,6 +1336,18 @@ def _run_transfer_job(settings: Settings, job: _TransferJob) -> dict:
             "error": str(exc)[:2000],
             "local_path": kept,
         }
+    except HostsExhausted as exc:
+        kept = None
+        if local_path is not None and local_path.exists():
+            kept = str(local_path.resolve())
+        return {
+            "ok": False,
+            "hosts_exhausted": True,
+            "db_id": job.db_id,
+            "youtube_video_id": job.youtube_video_id,
+            "error": str(exc)[:2000],
+            "local_path": kept,
+        }
     except Exception as exc:
         kept = None
         if local_path is not None and local_path.exists():
@@ -1564,6 +1588,19 @@ def transfer_videos(
                             )
                             break
 
+                        if result.get("hosts_exhausted"):
+                            video.transfer_status = "failed"
+                            video.transfer_error = result.get("error")
+                            video.local_path = result.get("local_path")
+                            failed += 1
+                            log.error(
+                                "Skipping %s after Video unavailable on every host. "
+                                "Continuing with the rest of the queue.",
+                                job.youtube_video_id,
+                            )
+                            session.commit()
+                            continue
+
                         if result["ok"]:
                             bunny_info = result["bunny"]
                             video.file_size = result.get("file_size")
@@ -1766,6 +1803,18 @@ def transfer_shorts(
                         job.youtube_video_id,
                     )
                     break
+                if result.get("hosts_exhausted"):
+                    short.transfer_status = "failed"
+                    short.transfer_error = result.get("error")
+                    short.local_path = result.get("local_path")
+                    failed += 1
+                    log.error(
+                        "Skipping short %s after Video unavailable on every host. "
+                        "Continuing with the rest of the queue.",
+                        job.youtube_video_id,
+                    )
+                    session.commit()
+                    continue
                 if result["ok"]:
                     bunny_info = result["bunny"]
                     short.file_size = result.get("file_size")
@@ -2034,6 +2083,18 @@ def transfer_playlist_items(
                         job.youtube_video_id,
                     )
                     break
+                if result.get("hosts_exhausted"):
+                    item.transfer_status = "failed"
+                    item.transfer_error = result.get("error")
+                    item.local_path = result.get("local_path")
+                    failed += 1
+                    log.error(
+                        "Skipping playlist item %s after Video unavailable on every host. "
+                        "Continuing with the rest of the queue.",
+                        job.youtube_video_id,
+                    )
+                    session.commit()
+                    continue
                 if result["ok"]:
                     bunny_info = result["bunny"]
                     item.file_size = result.get("file_size")

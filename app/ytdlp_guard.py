@@ -58,6 +58,10 @@ class RateLimitAbort(RuntimeError):
     """Raised when cooldowns/cookie rotations are exhausted — stop the transfer run."""
 
 
+class HostsExhausted(RuntimeError):
+    """This video failed on every proxy host. Skip it and keep the queue moving."""
+
+
 class CookiePool:
     """
     Ordered list of Netscape cookie files.
@@ -158,6 +162,9 @@ class YoutubeDownloadGuard:
         self._abort_reason = ""
         self._cookies: CookiePool | None = None
         self._configured = False
+        # Survives reset_run() so a video that blocks every host again after a
+        # restart can be skipped instead of pausing the queue forever.
+        self._hosts_exhausted_counts: dict[str, int] = {}
 
     def configure(self, settings, *, force_reload: bool = False) -> None:
         with self._lock:
@@ -244,6 +251,21 @@ class YoutubeDownloadGuard:
     def cookiefile(self) -> Path | None:
         assert self._cookies is not None
         return self._cookies.current()
+
+    def abort_reason(self) -> str:
+        with self._lock:
+            return self._abort_reason
+
+    def note_hosts_exhausted(self, video_id: str) -> int:
+        """How many times this video has failed on every configured proxy host."""
+        with self._lock:
+            count = self._hosts_exhausted_counts.get(video_id, 0) + 1
+            self._hosts_exhausted_counts[video_id] = count
+            return count
+
+    def clear_host_failure(self, video_id: str) -> None:
+        with self._lock:
+            self._hosts_exhausted_counts.pop(video_id, None)
 
     def is_aborted(self) -> bool:
         with self._lock:

@@ -1,11 +1,12 @@
 from __future__ import annotations
 
 import logging
+import time
 
 from sqlalchemy import func
 from sqlalchemy.orm import Session, sessionmaker
 
-from app.config import Settings
+from app.config import Settings, reset_youtube_proxy
 from app.excel import load_excel
 from app.export_json import export_jsons
 from app.metadata import fetch_all_metadata
@@ -53,36 +54,84 @@ def run_upload(session: Session, settings: Settings, **kwargs) -> None:
     log.info("Upload finished: %s uploaded, %s failed", uploaded, failed)
 
 
+def _sleep_until_restart(seconds: float) -> None:
+    """Wait out a YouTube pause, and log occasionally so tmux shows it is alive."""
+    remaining = max(0.0, float(seconds))
+    since_log = 0.0
+    while remaining > 0:
+        step = min(30.0, remaining)
+        time.sleep(step)
+        remaining -= step
+        since_log += step
+        if remaining > 0 and since_log >= 300:
+            log.info("Transfer restart in %.0fs", remaining)
+            since_log = 0.0
+
+
 def run_transfer(session: Session, settings: Settings, **kwargs) -> None:
-    uploaded, failed, _skipped = transfer_videos(session, settings, **kwargs)
-    remaining = (
-        session.query(func.count(Video.id))
-        .filter(Video.is_short.is_(False), Video.transfer_status == "failed")
-        .scalar()
-        or 0
-    )
-    still_pending = (
-        session.query(func.count(Video.id))
-        .filter(
-            Video.is_short.is_(False),
-            Video.transfer_status.in_(["pending", "downloaded", "downloading", "uploading"]),
+    from app.ytdlp_guard import DOWNLOAD_GUARD
+
+    restarts = 0
+    max_restarts = max(0, int(settings.transfer_auto_restarts))
+    while True:
+        reset_youtube_proxy()
+        uploaded, failed, _skipped = transfer_videos(session, settings, **kwargs)
+        remaining = (
+            session.query(func.count(Video.id))
+            .filter(Video.is_short.is_(False), Video.transfer_status == "failed")
+            .scalar()
+            or 0
         )
-        .scalar()
-        or 0
-    )
-    log.info(
-        "Transfer finished: %s uploaded (download→upload→delete), %s failed this run; "
-        "still not on Bunny: %s failed + %s pending/leftover",
-        uploaded,
-        failed,
-        remaining,
-        still_pending,
-    )
-    if remaining or still_pending:
+        still_pending = (
+            session.query(func.count(Video.id))
+            .filter(
+                Video.is_short.is_(False),
+                Video.transfer_status.in_(
+                    ["pending", "downloaded", "downloading", "uploading"]
+                ),
+            )
+            .scalar()
+            or 0
+        )
         log.info(
-            "Run again later with: python main.py transfer --retry-failed "
-            "(after YouTube rate-limit cools down)"
+            "Transfer finished: %s uploaded (download→upload→delete), %s failed this run; "
+            "still not on Bunny: %s failed + %s pending/leftover",
+            uploaded,
+            failed,
+            remaining,
+            still_pending,
         )
+        aborted = DOWNLOAD_GUARD.is_aborted()
+        if aborted and max_restarts > 0 and restarts < max_restarts:
+            restarts += 1
+            if uploaded == 0:
+                delay = max(60.0, float(settings.rate_limit_cooldown_seconds))
+            else:
+                delay = max(30.0, float(settings.transfer_restart_delay_seconds))
+            reason = DOWNLOAD_GUARD.abort_reason() or "YouTube block"
+            log.warning(
+                "Transfer paused: %s Automatic restart %s/%s in %.0fs. "
+                "Pending jobs stay queued.",
+                reason,
+                restarts,
+                max_restarts,
+                delay,
+            )
+            _sleep_until_restart(delay)
+            continue
+        if aborted and max_restarts > 0:
+            log.error(
+                "Automatic restarts used up (%s). Pending rows were left queued. "
+                "Re-run later with: python main.py transfer --retry-failed",
+                max_restarts,
+            )
+        elif remaining or still_pending:
+            log.info(
+                "Run again later with: python main.py transfer --retry-failed "
+                "(after YouTube rate-limit cools down)"
+            )
+        break
+
     # Fill any missing Storage thumbnails (videos/shorts/playlists/playlist-items).
     # Skips rows that already have bunny_thumbnail_url.
     t_up, t_fail, t_skip = transfer_thumbnails(
