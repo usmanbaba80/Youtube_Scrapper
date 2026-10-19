@@ -165,6 +165,8 @@ class YoutubeDownloadGuard:
         # Survives reset_run() so a video that blocks every host again after a
         # restart can be skipped instead of pausing the queue forever.
         self._hosts_exhausted_counts: dict[str, int] = {}
+        self._skipped_ids: set[str] = set()
+        self._unavailable_streak = 0
 
     def configure(self, settings, *, force_reload: bool = False) -> None:
         with self._lock:
@@ -202,6 +204,7 @@ class YoutubeDownloadGuard:
             self._abort = False
             self._abort_reason = ""
             self._cooldown_rounds = 0
+            self._unavailable_streak = 0
             # Reload cookie files so newly dropped cookies.txt are picked up.
             self._configured = False
 
@@ -266,6 +269,25 @@ class YoutubeDownloadGuard:
     def clear_host_failure(self, video_id: str) -> None:
         with self._lock:
             self._hosts_exhausted_counts.pop(video_id, None)
+            self._unavailable_streak = 0
+
+    def was_skipped(self, video_id: str) -> bool:
+        with self._lock:
+            return video_id in self._skipped_ids
+
+    def note_unavailable_streak(self, video_id: str) -> int:
+        """Remember this video and return how many unavailable skips happened in a row."""
+        with self._lock:
+            self._skipped_ids.add(video_id)
+            self._unavailable_streak += 1
+            return self._unavailable_streak
+
+    def pause_briefly(self, seconds: float, *, reason: str) -> None:
+        """Wait before the next video without counting a full rate-limit round."""
+        wait = max(30.0, float(seconds))
+        with self._lock:
+            self._cooldown_until = max(self._cooldown_until, time.time() + wait)
+        log.warning("%s Next download waits %.0fs.", reason, wait)
 
     def is_aborted(self) -> bool:
         with self._lock:

@@ -3,6 +3,7 @@ from __future__ import annotations
 import logging
 import re
 import shutil
+import sys
 import time
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -379,6 +380,35 @@ def _max_listed_height(info: dict) -> int:
     return max(best, selected)
 
 
+class _YtdlpLogCapture:
+    """Record yt-dlp lines and still print them. HTTP 429 often arrives only as a warning."""
+
+    def __init__(self) -> None:
+        self.messages: list[str] = []
+
+    def _keep(self, message: str) -> None:
+        self.messages.append(message)
+        print(message, file=sys.stderr, flush=True)
+
+    def debug(self, message: str) -> None:
+        text = str(message)
+        if text.startswith("[debug] "):
+            return
+        self._keep(text)
+
+    def info(self, message: str) -> None:
+        self._keep(str(message))
+
+    def warning(self, message: str) -> None:
+        self._keep(f"WARNING: {message}")
+
+    def error(self, message: str) -> None:
+        self._keep(f"ERROR: {message}")
+
+    def joined(self) -> str:
+        return "\n".join(self.messages)
+
+
 def _ytdlp_probe_max_height(
     opts: dict,
     *,
@@ -390,8 +420,16 @@ def _ytdlp_probe_max_height(
     # No pre-download sleep when we are only listing formats.
     probe_opts["sleep_interval"] = 0
     probe_opts["max_sleep_interval"] = 0
-    with YoutubeDL(probe_opts) as ydl:
-        info = ydl.extract_info(page_url, download=False)
+    capture = _YtdlpLogCapture()
+    probe_opts["logger"] = capture
+    try:
+        with YoutubeDL(probe_opts) as ydl:
+            info = ydl.extract_info(page_url, download=False)
+    except Exception as exc:
+        blob = f"{exc}\n{capture.joined()}"
+        if is_youtube_rate_limited(blob):
+            raise RuntimeError(blob) from exc
+        raise
     if not info:
         raise RuntimeError("yt-dlp returned no info while listing formats")
     return _max_listed_height(info)
@@ -407,7 +445,25 @@ def download_video(settings: Settings, video: Video, output_dir: Path) -> Path:
     download_url = _watch_url(video.youtube_video_id)
 
     log.info("Downloading %s (%s)", video.youtube_video_id, video.title or video.url)
+    if DOWNLOAD_GUARD.was_skipped(video.youtube_video_id):
+        raise HostsExhausted(
+            f"{video.youtube_video_id} was already skipped this run "
+            "(Video unavailable on another host). Continuing with the queue."
+        )
     tried_exits: set[str] = set()
+
+    def _skip_unavailable_video() -> None:
+        streak = DOWNLOAD_GUARD.note_unavailable_streak(video.youtube_video_id)
+        if streak >= 3:
+            DOWNLOAD_GUARD.abort_run(
+                "Three videos in a row were Video unavailable after switching "
+                "NordVPN host. Pausing so the transfer can restart after a cooldown."
+            )
+        raise HostsExhausted(
+            "Video unavailable for "
+            f"{video.youtube_video_id} after trying another NordVPN host. "
+            "Skipping it so the rest of the queue can continue."
+        )
 
     def _switch_exit() -> bool:
         nxt = switch_youtube_proxy(tried_exits)
@@ -498,6 +554,14 @@ def download_video(settings: Settings, video: Video, output_dir: Path) -> Path:
                     listed_h = _ytdlp_probe_max_height(opts, page_url=download_url)
                 except Exception as exc:
                     last_error = exc
+                    if is_youtube_rate_limited(exc):
+                        rate_limited = True
+                        log.warning(
+                            "YouTube rate-limit (HTTP 429) while probing %s; "
+                            "stopping further client plans",
+                            video.youtube_video_id,
+                        )
+                        break
                     anonymous_blocked = not with_cookies and (
                         is_youtube_bot_check(exc) or is_youtube_rate_limited(exc)
                     )
@@ -537,6 +601,13 @@ def download_video(settings: Settings, video: Video, output_dir: Path) -> Path:
                         cdn_403_plans += 1
                     if with_cookies and is_youtube_unavailable(exc):
                         cookie_unavailable = True
+                        if tried_exits:
+                            log.warning(
+                                "Cookie clients still say Video unavailable for %s "
+                                "after a host switch; skipping guest probes to avoid HTTP 429",
+                                video.youtube_video_id,
+                            )
+                            break
                     log.warning(
                         "Format probe failed for %s with %s (%s); trying next plan",
                         video.youtube_video_id,
@@ -578,6 +649,15 @@ def download_video(settings: Settings, video: Video, output_dir: Path) -> Path:
                 if not released:
                     DOWNLOAD_GUARD.release(ok=False)
                     released = True
+                if cookie_unavailable or guest_blocked:
+                    DOWNLOAD_GUARD.pause_briefly(
+                        120,
+                        reason=(
+                            f"YouTube returned HTTP 429 while {video.youtube_video_id} "
+                            "was already unavailable."
+                        ),
+                    )
+                    _skip_unavailable_video()
                 if last_error and is_youtube_rate_limited(last_error):
                     DOWNLOAD_GUARD.trip_rate_limit(
                         settings, video_id=video.youtube_video_id
@@ -585,28 +665,14 @@ def download_video(settings: Settings, video: Video, output_dir: Path) -> Path:
                 continue
 
             if best_plan is None:
-                if cookie_unavailable and guest_blocked:
+                if cookie_unavailable and (guest_blocked or tried_exits):
                     if not released:
                         DOWNLOAD_GUARD.release(ok=False)
                         released = True
-                    if _switch_exit():
+                    # One other NordVPN exit is enough. More guest probes collect 429s.
+                    if not tried_exits and _switch_exit():
                         continue
-                    host_fails = DOWNLOAD_GUARD.note_hosts_exhausted(
-                        video.youtube_video_id
-                    )
-                    give_up = max(1, int(settings.transfer_same_video_host_fails))
-                    if host_fails >= give_up:
-                        raise HostsExhausted(
-                            "Video unavailable on every NordVPN host for "
-                            f"{video.youtube_video_id} ({host_fails} time(s)). "
-                            "Skipping this video and continuing the queue."
-                        )
-                    DOWNLOAD_GUARD.abort_run(
-                        "YouTube blocked every NordVPN exit on "
-                        f"{video.youtube_video_id}: cookie clients returned "
-                        "'Video unavailable' and anonymous clients asked for "
-                        "sign-in. Pausing so the transfer can restart after a cooldown."
-                    )
+                    _skip_unavailable_video()
                 if (
                     cdn_403_plans >= 2
                     and cookiefile is not None
