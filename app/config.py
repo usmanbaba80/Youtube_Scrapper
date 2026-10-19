@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import threading
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -172,33 +173,109 @@ def load_settings() -> Settings:
     )
 
 
-def youtube_proxy_url() -> str:
-    """
-    Proxy used only by this app's YouTube calls.
+class _NordProxyPool:
+    """Ordered NordVPN SOCKS exits for this process. Other server traffic is untouched."""
 
-    A full YTDLP_PROXY wins. Otherwise build a NordVPN SOCKS5 URL from
-    service credentials. Nothing is returned until host, username, and
-    password are all set, so the server IP stays in use until then.
-    """
-    explicit = _env("YTDLP_PROXY")
-    if explicit:
-        return explicit
+    def __init__(self, urls: list[str]) -> None:
+        self._urls = urls
+        self._index = 0
+        self._lock = threading.Lock()
 
-    host = _env("NORDVPN_SOCKS_HOST")
-    user = _env("NORDVPN_SOCKS_USER")
-    password = _env("NORDVPN_SOCKS_PASSWORD")
-    if not (host and user and password):
-        return ""
+    def __len__(self) -> int:
+        return len(self._urls)
 
+    def all(self) -> list[str]:
+        with self._lock:
+            return list(self._urls)
+
+    def current(self) -> str:
+        with self._lock:
+            if not self._urls:
+                return ""
+            return self._urls[self._index % len(self._urls)]
+
+    def rotate(self) -> str:
+        with self._lock:
+            if not self._urls:
+                return ""
+            if len(self._urls) == 1:
+                return self._urls[0]
+            self._index = (self._index + 1) % len(self._urls)
+            return self._urls[self._index]
+
+
+_PROXY_POOL: _NordProxyPool | None = None
+
+
+def _clean_socks_host(raw: str) -> str:
+    host = raw.strip()
     host = host.removeprefix("socks5h://").removeprefix("socks5://").strip("/")
+    if "@" in host:
+        host = host.split("@", 1)[1]
     if host.startswith("http://") or host.startswith("https://"):
         return ""
+    return host
+
+
+def _build_proxy_urls() -> list[str]:
+    explicit = _env("YTDLP_PROXY")
+    if explicit:
+        return [explicit]
+    hosts: list[str] = []
+    seen: set[str] = set()
+    for part in _env("NORDVPN_SOCKS_HOST").split(","):
+        host = _clean_socks_host(part)
+        key = host.lower()
+        if not host or key in seen:
+            continue
+        seen.add(key)
+        hosts.append(host)
+    user = _env("NORDVPN_SOCKS_USER")
+    password = _env("NORDVPN_SOCKS_PASSWORD")
+    if not hosts or not user or not password:
+        return []
     port = _env("NORDVPN_SOCKS_PORT") or "1080"
+    user_q = quote(user, safe="")
+    pass_q = quote(password, safe="")
     # socks5h resolves YouTube's hostname at the proxy, not on this server.
-    return (
-        f"socks5h://{quote(user, safe='')}:{quote(password, safe='')}"
-        f"@{host}:{port}"
-    )
+    return [f"socks5h://{user_q}:{pass_q}@{host}:{port}" for host in hosts]
+
+
+def _proxy_pool() -> _NordProxyPool:
+    global _PROXY_POOL
+    if _PROXY_POOL is None:
+        _PROXY_POOL = _NordProxyPool(_build_proxy_urls())
+    return _PROXY_POOL
+
+
+def youtube_proxy_url() -> str:
+    """
+    Current YouTube SOCKS URL for this process.
+
+    NORDVPN_SOCKS_HOST may list several hosts separated by commas. The first
+    is used until switch_youtube_proxy() moves to the next. A YTDLP_PROXY
+    value is a single fixed URL. Empty means YouTube stays on the server IP.
+    """
+    return _proxy_pool().current()
+
+
+def switch_youtube_proxy(tried_labels: set[str]) -> str:
+    """
+    Mark the current exit as used and return the next host that is not in
+    tried_labels. Returns "" when every configured host was already tried.
+    """
+    pool = _proxy_pool()
+    current = pool.current()
+    if not current:
+        return ""
+    tried_labels.add(youtube_proxy_label(current))
+    if len(pool) <= 1:
+        return ""
+    for _ in range(len(pool)):
+        nxt = pool.rotate()
+        if youtube_proxy_label(nxt) not in tried_labels:
+            return nxt
+    return ""
 
 
 def youtube_proxy_label(proxy_url: str) -> str:

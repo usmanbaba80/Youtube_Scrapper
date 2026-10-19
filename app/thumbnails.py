@@ -48,15 +48,18 @@ def _guess_ext(url: str, content_type: str | None) -> str:
 
 
 def _download_thumbnail(url: str, settings: Settings) -> tuple[bytes, str]:
+    from app.config import youtube_proxy_url
+
     proxies = None
     host = (urlparse(url).hostname or "").lower()
-    if settings.youtube_proxy and (
+    proxy = youtube_proxy_url()
+    if proxy and (
         host.endswith("youtube.com")
         or host.endswith("ytimg.com")
         or host.endswith("ggpht.com")
         or host.endswith("googlevideo.com")
     ):
-        proxies = {"http": settings.youtube_proxy, "https": settings.youtube_proxy}
+        proxies = {"http": proxy, "https": proxy}
     response = requests.get(
         url,
         timeout=60,

@@ -5,6 +5,7 @@ import time
 
 import requests
 
+from app.metadata import preferred_title_description
 from app.utils import extract_video_id, playlist_url, watch_url
 
 log = logging.getLogger(__name__)
@@ -31,9 +32,10 @@ def fetch_channel_playlists(
     page_token: str | None = None
     while len(items) < limit:
         params = {
-            "part": "snippet,contentDetails,status",
+            "part": "snippet,contentDetails,status,localizations",
             "channelId": channel_id,
             "maxResults": min(50, limit - len(items)),
+            "hl": "en",
             "key": api_key,
         }
         if page_token:
@@ -61,12 +63,13 @@ def fetch_channel_playlists(
             thumb_url = thumb.get("url")
             if thumb_url and ("no_thumbnail" in thumb_url.lower() or "/img/no_" in thumb_url.lower()):
                 thumb_url = None
+            title, description = preferred_title_description(item)
             items.append(
                 {
                     "youtube_playlist_id": yt_id,
                     "url": playlist_url(yt_id),
-                    "title": snippet.get("title"),
-                    "description": snippet.get("description"),
+                    "title": title,
+                    "description": description,
                     "published_at": snippet.get("publishedAt"),
                     "item_count": details.get("itemCount"),
                     "thumbnail_url": thumb_url,
@@ -113,11 +116,12 @@ def fetch_playlist_items(
             "part": "snippet,contentDetails",
             "playlistId": youtube_playlist_id,
             "maxResults": min(50, limit - len(items)),
+            "hl": "en",
             "key": api_key,
             "fields": (
                 "nextPageToken,"
                 "items(contentDetails/videoId,"
-                "snippet(title,description,publishedAt,resourceId/videoId,thumbnails))"
+                "snippet(title,description,localized,publishedAt,resourceId/videoId,thumbnails))"
             ),
         }
         if page_token:
@@ -150,7 +154,8 @@ def fetch_playlist_items(
                 or {}
             )
             # Keep description short in memory — full text is huge for kids channels.
-            desc = snippet.get("description") or ""
+            title, description = preferred_title_description(item)
+            desc = description or ""
             if len(desc) > 500:
                 desc = desc[:500]
             items.append(
@@ -158,7 +163,7 @@ def fetch_playlist_items(
                     "youtube_video_id": video_id,
                     "url": watch_url(video_id),
                     "position": position,
-                    "title": snippet.get("title"),
+                    "title": title,
                     "description": desc,
                     "published_at": snippet.get("publishedAt") or details.get("videoPublishedAt"),
                     "thumbnail_url": thumb.get("url"),

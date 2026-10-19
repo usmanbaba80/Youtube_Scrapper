@@ -8,15 +8,17 @@ import requests
 from sqlalchemy.orm import Session, joinedload
 
 from app.config import Settings
-from app.models import Playlist, PlaylistItem, Short, Video
-from app.utils import parse_iso8601_duration, utcnow
+from app.models import Creator, Playlist, PlaylistItem, Short, Video
+from app.utils import normalize_channel_ids, parse_iso8601_duration, utcnow
 
 log = logging.getLogger(__name__)
 
 API_URL = "https://www.googleapis.com/youtube/v3/videos"
 PLAYLISTS_API_URL = "https://www.googleapis.com/youtube/v3/playlists"
 BATCH_SIZE = 50
-PARTS = "snippet,contentDetails,statistics,status"
+PARTS = "snippet,contentDetails,statistics,status,localizations"
+# Ask for English in snippet.localized. The original title stays in snippet.title.
+METADATA_HL = "en"
 
 
 def _chunks(values: list[str], size: int) -> list[list[str]]:
@@ -31,6 +33,7 @@ def fetch_videos_metadata(api_key: str, video_ids: list[str]) -> dict[str, dict]
             params={
                 "part": PARTS,
                 "id": ",".join(batch),
+                "hl": METADATA_HL,
                 "key": api_key,
             },
             timeout=60,
@@ -54,6 +57,57 @@ def _int_or_none(value: str | None) -> int | None:
         return int(value)
     except ValueError:
         return None
+
+
+def _english_localization(localizations: dict) -> dict | None:
+    """Creator-provided English title/description, if any language code is en or en-*."""
+    if not isinstance(localizations, dict):
+        return None
+    folded = {
+        str(code).lower(): value
+        for code, value in localizations.items()
+        if isinstance(value, dict)
+    }
+    for code in ("en", "en-us", "en-gb", "en-in", "en-ca", "en-au"):
+        hit = folded.get(code)
+        if hit and (hit.get("title") or hit.get("description")):
+            return hit
+    for code, hit in folded.items():
+        if code.startswith("en-") or code.startswith("en_"):
+            if hit.get("title") or hit.get("description"):
+                return hit
+    return None
+
+
+def preferred_title_description(item: dict) -> tuple[str | None, str | None]:
+    """
+    English title and description when YouTube has them.
+
+    Dubbed videos with no English metadata keep snippet title/description,
+    which is the original upload language.
+    """
+    snippet = item.get("snippet") or {}
+    original_title = snippet.get("title")
+    original_description = snippet.get("description")
+
+    english = _english_localization(item.get("localizations") or {})
+    if english:
+        title = (english.get("title") or "").strip() or original_title
+        if english.get("description") is not None:
+            return title, english.get("description")
+        return title, original_description
+
+    localized = snippet.get("localized") or {}
+    loc_title = localized.get("title")
+    loc_description = localized.get("description")
+    title_differs = bool(loc_title) and loc_title != original_title
+    description_differs = loc_description is not None and loc_description != original_description
+    if title_differs or description_differs:
+        return (
+            loc_title or original_title,
+            loc_description if loc_description is not None else original_description,
+        )
+    return original_title, original_description
 
 
 def _thumb_url(snippet: dict) -> str | None:
@@ -83,9 +137,10 @@ def apply_metadata(video: Video, item: dict) -> None:
     duration_iso = details.get("duration")
     duration_seconds = parse_iso8601_duration(duration_iso)
     tags = snippet.get("tags") or []
+    title, description = preferred_title_description(item)
 
-    video.title = snippet.get("title") or video.title
-    video.description = snippet.get("description")
+    video.title = title or video.title
+    video.description = description
     video.published_at = snippet.get("publishedAt")
     video.duration_iso = duration_iso
     video.duration_seconds = duration_seconds
@@ -107,9 +162,10 @@ def apply_short_metadata(short: Short, item: dict) -> None:
     stats = item.get("statistics") or {}
     duration_iso = details.get("duration")
     tags = snippet.get("tags") or []
+    title, description = preferred_title_description(item)
 
-    short.title = snippet.get("title") or short.title
-    short.description = snippet.get("description")
+    short.title = title or short.title
+    short.description = description
     short.published_at = snippet.get("publishedAt")
     short.duration_iso = duration_iso
     short.duration_seconds = parse_iso8601_duration(duration_iso)
@@ -130,8 +186,9 @@ def apply_playlist_item_metadata(item_row: PlaylistItem, item: dict) -> None:
     details = item.get("contentDetails") or {}
     duration_iso = details.get("duration")
 
-    item_row.title = snippet.get("title") or item_row.title
-    item_row.description = snippet.get("description")
+    title, description = preferred_title_description(item)
+    item_row.title = title or item_row.title
+    item_row.description = description
     item_row.published_at = snippet.get("publishedAt") or item_row.published_at
     item_row.duration_iso = duration_iso
     item_row.duration_seconds = parse_iso8601_duration(duration_iso)
@@ -145,8 +202,9 @@ def apply_playlist_item_metadata(item_row: PlaylistItem, item: dict) -> None:
 def apply_playlist_metadata(playlist: Playlist, item: dict) -> None:
     snippet = item.get("snippet") or {}
     details = item.get("contentDetails") or {}
-    playlist.title = snippet.get("title") or playlist.title
-    playlist.description = snippet.get("description")
+    title, description = preferred_title_description(item)
+    playlist.title = title or playlist.title
+    playlist.description = description
     playlist.published_at = snippet.get("publishedAt")
     playlist.item_count = details.get("itemCount")
     playlist.thumbnail_url = _thumb_url(snippet) or playlist.thumbnail_url
@@ -162,8 +220,9 @@ def _fetch_playlists_metadata(api_key: str, playlist_ids: list[str]) -> dict[str
         response = requests.get(
             PLAYLISTS_API_URL,
             params={
-                "part": "snippet,contentDetails,status",
+                "part": "snippet,contentDetails,status,localizations",
                 "id": ",".join(batch),
+                "hl": METADATA_HL,
                 "key": api_key,
             },
             timeout=60,
@@ -179,7 +238,11 @@ def _fetch_playlists_metadata(api_key: str, playlist_ids: list[str]) -> dict[str
     return results
 
 
-def _purge_oversized_shorts(session: Session, settings: Settings) -> int:
+def _purge_oversized_shorts(
+    session: Session,
+    settings: Settings,
+    channel_ids: list[int] | None = None,
+) -> int:
     """
     Delete Short rows that are actually long-form VODs.
 
@@ -189,14 +252,13 @@ def _purge_oversized_shorts(session: Session, settings: Settings) -> int:
     produce 30–60 minute "shorts".
     """
     limit = settings.max_short_duration_seconds
-    fakes = (
-        session.query(Short)
-        .filter(
-            Short.duration_seconds.isnot(None),
-            Short.duration_seconds > limit,
-        )
-        .all()
+    query = session.query(Short).filter(
+        Short.duration_seconds.isnot(None),
+        Short.duration_seconds > limit,
     )
+    if channel_ids is not None:
+        query = query.filter(Short.creator_row_id.in_(channel_ids))
+    fakes = query.all()
     removed = 0
     for short in fakes:
         log.warning(
@@ -229,19 +291,57 @@ def fetch_all_metadata(
     settings: Settings,
     *,
     retry_failed: bool = False,
+    force: bool = False,
+    channel_ids: list[int] | None = None,
+    channel_id: int | None = None,
 ) -> tuple[int, int]:
     if not settings.youtube_api_key:
         raise RuntimeError("YOUTUBE_API_KEY is missing. Add it to .env")
 
-    statuses = ["pending", "failed"] if retry_failed else ["pending"]
+    channel_ids = normalize_channel_ids(channel_ids, channel_id=channel_id)
+    if force and not channel_ids:
+        raise ValueError(
+            "metadata --force requires --channel-id (creators.id) so only that creator is refreshed"
+        )
+    if channel_ids:
+        creators = (
+            session.query(Creator)
+            .filter(Creator.id.in_(channel_ids))
+            .order_by(Creator.id.asc())
+            .all()
+        )
+        found = {creator.id for creator in creators}
+        missing_ids = [cid for cid in channel_ids if cid not in found]
+        if missing_ids:
+            raise ValueError(
+                "No creator row for --channel-id "
+                + ", ".join(str(cid) for cid in missing_ids)
+            )
+        log.info(
+            "Metadata %s for %s",
+            "force refresh" if force else "fetch",
+            ", ".join(f"id={creator.id} {creator.name}" for creator in creators),
+        )
+
+    # force ignores metadata_status and rewrites title/description already stored.
+    statuses = None if force else (["pending", "failed"] if retry_failed else ["pending"])
     updated = 0
     missing = 0
 
+    def _scoped(query, model):
+        if statuses is not None:
+            query = query.filter(model.metadata_status.in_(statuses))
+        if channel_ids is not None:
+            query = query.filter(model.creator_row_id.in_(channel_ids))
+        return query
+
     # --- Long-form videos ---
     videos = (
-        session.query(Video)
-        .options(joinedload(Video.creator))
-        .filter(Video.metadata_status.in_(statuses), Video.is_short.is_(False))
+        _scoped(
+            session.query(Video).options(joinedload(Video.creator)),
+            Video,
+        )
+        .filter(Video.is_short.is_(False))
         .order_by(Video.id.asc())
         .all()
     )
@@ -267,9 +367,10 @@ def fetch_all_metadata(
 
     # --- Shorts ---
     shorts = (
-        session.query(Short)
-        .options(joinedload(Short.creator))
-        .filter(Short.metadata_status.in_(statuses))
+        _scoped(
+            session.query(Short).options(joinedload(Short.creator)),
+            Short,
+        )
         .order_by(Short.id.asc())
         .all()
     )
@@ -291,7 +392,7 @@ def fetch_all_metadata(
 
     # Drop fake "shorts": channels without a Shorts tab can still return long-form
     # videoIds from /shorts browse JSON; /shorts/{id} then redirects to watch.
-    removed_fake = _purge_oversized_shorts(session, settings)
+    removed_fake = _purge_oversized_shorts(session, settings, channel_ids)
     if removed_fake:
         log.info(
             "Removed %s fake shorts longer than %ss (not real YouTube Shorts)",
@@ -301,8 +402,7 @@ def fetch_all_metadata(
 
     # --- Playlists (only if still pending; scrape often already filled them) ---
     playlists = (
-        session.query(Playlist)
-        .filter(Playlist.metadata_status.in_(statuses))
+        _scoped(session.query(Playlist), Playlist)
         .order_by(Playlist.id.asc())
         .all()
     )
@@ -323,15 +423,12 @@ def fetch_all_metadata(
         log.info("No playlists waiting for metadata")
 
     # --- Playlist items NOT linked to videos/shorts ---
-    orphan_items = (
-        session.query(PlaylistItem)
-        .filter(
-            PlaylistItem.reuse_source == "none",
-            PlaylistItem.metadata_status.in_(statuses),
-        )
-        .order_by(PlaylistItem.id.asc())
-        .all()
-    )
+    orphan_query = session.query(PlaylistItem).filter(PlaylistItem.reuse_source == "none")
+    if statuses is not None:
+        orphan_query = orphan_query.filter(PlaylistItem.metadata_status.in_(statuses))
+    if channel_ids is not None:
+        orphan_query = orphan_query.filter(PlaylistItem.creator_row_id.in_(channel_ids))
+    orphan_items = orphan_query.order_by(PlaylistItem.id.asc()).all()
     if orphan_items:
         ids = list(dict.fromkeys(i.youtube_video_id for i in orphan_items))
         log.info(
@@ -351,20 +448,32 @@ def fetch_all_metadata(
     else:
         log.info("No unlinked playlist items waiting for metadata")
 
-    # Linked items: mark reused metadata without API calls
-    reused = (
-        session.query(PlaylistItem)
-        .filter(
-            PlaylistItem.reuse_source.in_(["video", "short"]),
-            PlaylistItem.metadata_status.in_(["pending", "failed"]),
-        )
-        .all()
+    # Linked items copy the refreshed video/short text. No extra YouTube call.
+    reused_query = session.query(PlaylistItem).filter(
+        PlaylistItem.reuse_source.in_(["video", "short"])
     )
+    if not force:
+        reused_query = reused_query.filter(
+            PlaylistItem.metadata_status.in_(["pending", "failed"])
+        )
+    if channel_ids is not None:
+        reused_query = reused_query.filter(PlaylistItem.creator_row_id.in_(channel_ids))
+    reused = reused_query.all()
     for row in reused:
+        source = row.video if row.reuse_source == "video" else row.short
+        if source is not None:
+            row.title = source.title
+            row.description = source.description
+            row.published_at = source.published_at
+            row.thumbnail_url = source.thumbnail_url or row.thumbnail_url
+            row.duration_iso = source.duration_iso
+            row.duration_seconds = source.duration_seconds
         row.metadata_status = "reused"
         row.metadata_error = None
-        row.transfer_status = "skipped"
-        row.transfer_error = f"Reuses {row.reuse_source} row; skip download/upload"
+        row.metadata_fetched_at = utcnow()
+        if not force:
+            row.transfer_status = "skipped"
+            row.transfer_error = f"Reuses {row.reuse_source} row; skip download/upload"
         updated += 1
 
     session.commit()

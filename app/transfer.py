@@ -19,7 +19,7 @@ from app.bunny import (
     FOLDER_VIDEOS,
     BunnyStream,
 )
-from app.config import Settings, youtube_proxy_label
+from app.config import Settings, switch_youtube_proxy, youtube_proxy_label, youtube_proxy_url
 from app.models import Creator, PlaylistItem, Short, Video
 from app.thumbnails import (
     transfer_playlist_thumbnails,
@@ -296,13 +296,17 @@ def _ytdlp_download_opts(
     elif settings.cookies_from_browser:
         opts["cookiesfrombrowser"] = (settings.cookies_from_browser,)
     global _proxy_logged
-    if settings.youtube_proxy:
+    proxy = youtube_proxy_url()
+    if proxy:
         # yt-dlp only. Bunny uploads and Postgres stay on the server IP.
-        opts["proxy"] = settings.youtube_proxy
+        opts["proxy"] = proxy
         if not _proxy_logged:
+            from app.config import _proxy_pool
+
+            labels = [youtube_proxy_label(url) for url in _proxy_pool().all()]
             log.info(
-                "YouTube download proxy %s (this project only)",
-                youtube_proxy_label(settings.youtube_proxy),
+                "YouTube download proxies %s (this project only; rotates when an exit is restricted)",
+                ", ".join(labels),
             )
             _proxy_logged = True
     elif not _proxy_logged and _nordvpn_host_without_credentials():
@@ -402,6 +406,18 @@ def download_video(settings: Settings, video: Video, output_dir: Path) -> Path:
     download_url = _watch_url(video.youtube_video_id)
 
     log.info("Downloading %s (%s)", video.youtube_video_id, video.title or video.url)
+    tried_exits: set[str] = set()
+
+    def _switch_exit() -> bool:
+        nxt = switch_youtube_proxy(tried_exits)
+        if not nxt:
+            return False
+        log.warning(
+            "NordVPN exit restricted for %s. Switching YouTube proxy to %s",
+            video.youtube_video_id,
+            youtube_proxy_label(nxt),
+        )
+        return True
 
     while True:
         DOWNLOAD_GUARD.raise_if_aborted()
@@ -449,6 +465,7 @@ def download_video(settings: Settings, video: Video, output_dir: Path) -> Path:
             best_probe_height = -1
             cookie_unavailable = False
             guest_blocked = False
+            retry_on_new_exit = False
             for plan_i, (clients, with_cookies) in enumerate(unique_plans):
                 plan_cookies = cookiefile if with_cookies else None
                 opts = _ytdlp_download_opts(
@@ -501,15 +518,16 @@ def download_video(settings: Settings, video: Video, output_dir: Path) -> Path:
                             video.youtube_video_id,
                         )
                         continue
-                    if is_youtube_bot_check(exc):
-                        DOWNLOAD_GUARD.release(ok=False)
-                        released = True
-                        DOWNLOAD_GUARD.trip_bot_check(
-                            settings, video_id=video.youtube_video_id
-                        )
-                        rate_limited = True
-                        break
-                    if is_youtube_rate_limited(exc):
+                    if is_youtube_bot_check(exc) or is_youtube_rate_limited(exc):
+                        if _switch_exit():
+                            retry_on_new_exit = True
+                            break
+                        if is_youtube_bot_check(exc):
+                            DOWNLOAD_GUARD.release(ok=False)
+                            released = True
+                            DOWNLOAD_GUARD.trip_bot_check(
+                                settings, video_id=video.youtube_video_id
+                            )
                         rate_limited = True
                         break
                     message = str(exc).lower()
@@ -549,6 +567,12 @@ def download_video(settings: Settings, video: Video, output_dir: Path) -> Path:
                     )
                     break
 
+            if retry_on_new_exit:
+                if not released:
+                    DOWNLOAD_GUARD.release(ok=False)
+                    released = True
+                continue
+
             if rate_limited:
                 if not released:
                     DOWNLOAD_GUARD.release(ok=False)
@@ -564,20 +588,23 @@ def download_video(settings: Settings, video: Video, output_dir: Path) -> Path:
                     if not released:
                         DOWNLOAD_GUARD.release(ok=False)
                         released = True
+                    if _switch_exit():
+                        continue
                     DOWNLOAD_GUARD.abort_run(
-                        "YouTube blocked this downloader on "
+                        "YouTube blocked every NordVPN exit on "
                         f"{video.youtube_video_id}: cookie clients returned "
                         "'Video unavailable' and anonymous clients asked for "
-                        "sign-in. cookies.txt has been rotated or this IP is "
-                        "flagged. Export a fresh Netscape cookies.txt from a "
-                        "browser logged into YouTube on this same machine, "
-                        "replace YTDLP_COOKIES, and re-run. Remaining videos "
-                        "were left pending."
+                        "sign-in. Remaining videos were left pending."
                     )
                 if (
                     cdn_403_plans >= 2
                     and cookiefile is not None
                 ):
+                    if _switch_exit():
+                        if not released:
+                            DOWNLOAD_GUARD.release(ok=False)
+                            released = True
+                        continue
                     DOWNLOAD_GUARD.release(ok=False)
                     released = True
                     log.error(
@@ -640,15 +667,16 @@ def download_video(settings: Settings, video: Video, output_dir: Path) -> Path:
                     return filepath
                 except Exception as exc:
                     last_error = exc
-                    if is_youtube_bot_check(exc):
-                        DOWNLOAD_GUARD.release(ok=False)
-                        released = True
-                        DOWNLOAD_GUARD.trip_bot_check(
-                            settings, video_id=video.youtube_video_id
-                        )
-                        rate_limited = True
-                        break
-                    if is_youtube_rate_limited(exc):
+                    if is_youtube_bot_check(exc) or is_youtube_rate_limited(exc):
+                        if _switch_exit():
+                            retry_on_new_exit = True
+                            break
+                        if is_youtube_bot_check(exc):
+                            DOWNLOAD_GUARD.release(ok=False)
+                            released = True
+                            DOWNLOAD_GUARD.trip_bot_check(
+                                settings, video_id=video.youtube_video_id
+                            )
                         rate_limited = True
                         break
                     message = str(exc).lower()
@@ -669,11 +697,19 @@ def download_video(settings: Settings, video: Video, output_dir: Path) -> Path:
                     )
                     time.sleep(sleep_for)
 
+            if retry_on_new_exit:
+                if not released:
+                    DOWNLOAD_GUARD.release(ok=False)
+                    released = True
+                continue
+
             if rate_limited:
                 if not released:
                     DOWNLOAD_GUARD.release(ok=False)
                     released = True
                 if last_error and is_youtube_rate_limited(last_error):
+                    if _switch_exit():
+                        continue
                     DOWNLOAD_GUARD.trip_rate_limit(
                         settings, video_id=video.youtube_video_id
                     )
@@ -685,6 +721,11 @@ def download_video(settings: Settings, video: Video, output_dir: Path) -> Path:
                 and last_error
                 and ("403" in str(last_error).lower() or "forbidden" in str(last_error).lower())
             ):
+                if _switch_exit():
+                    if not released:
+                        DOWNLOAD_GUARD.release(ok=False)
+                        released = True
+                    continue
                 DOWNLOAD_GUARD.release(ok=False)
                 released = True
                 log.error(

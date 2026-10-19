@@ -90,8 +90,9 @@ def build_parser() -> argparse.ArgumentParser:
         "--force",
         action="store_true",
         help=(
-            "Re-scrape channels; re-transfer videos already on Bunny (download+upload again); "
-            "re-upload thumbnails even if already present"
+            "Re-scrape channels; re-transfer videos already on Bunny; "
+            "re-upload thumbnails. With metadata, refetch one creator: "
+            "metadata --channel-id ID --force"
         ),
     )
     parser.add_argument(
@@ -158,7 +159,19 @@ def main() -> None:
                 media_types=media_types,
             )
         elif args.command == "metadata":
-            run_metadata(session, settings, retry_failed=args.retry_failed)
+            if args.force and not channel_ids:
+                print(
+                    "error: metadata --force requires --channel-id (creators.id)",
+                    file=sys.stderr,
+                )
+                raise SystemExit(2)
+            run_metadata(
+                session,
+                settings,
+                retry_failed=args.retry_failed,
+                force=args.force,
+                channel_ids=channel_ids,
+            )
         elif args.command == "download":
             run_download(
                 session,
