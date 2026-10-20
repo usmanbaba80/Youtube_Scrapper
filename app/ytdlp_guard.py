@@ -240,16 +240,16 @@ class YoutubeDownloadGuard:
                 f"; switched → {rotated.name}" if rotated else "",
                 cooldown,
             )
-            if self._cooldown_rounds >= max(1, settings.rate_limit_max_cooldowns) or (
-                not self._cookies or self._cookies.size <= 1
-            ):
-                self._abort = True
-                self._abort_reason = (
-                    "YouTube bot-check (Sign in to confirm you’re not a bot). "
-                    "Export fresh cookies to YTDLP_COOKIES_DIR (Netscape .txt) "
-                    "and re-run. Anonymous / android_vr downloads will not work."
+            # One cookie file is normal when NordVPN SOCKS hosts rotate.
+            # Do not stop the run on the first bot-check.
+            if self._cooldown_rounds >= max(1, settings.rate_limit_max_cooldowns):
+                log.error(
+                    "YouTube bot-check persisted on %s after %s round(s). "
+                    "Leaving this video and keeping the queue moving.",
+                    video_id,
+                    self._cooldown_rounds,
                 )
-                raise RateLimitAbort(self._abort_reason)
+                return
 
     def cookiefile(self) -> Path | None:
         assert self._cookies is not None
@@ -367,14 +367,13 @@ class YoutubeDownloadGuard:
                 f", switched cookies → {rotated.name}" if rotated else "",
             )
             if self._cooldown_rounds >= max(1, settings.rate_limit_max_cooldowns):
-                self._abort = True
-                self._abort_reason = (
-                    f"YouTube rate-limit persisted after {self._cooldown_rounds} "
-                    f"cooldown(s) / cookie rotation(s). "
-                    f"Re-export fresh cookies into YTDLP_COOKIES_DIR and re-run "
-                    f"with --retry-failed later."
+                log.error(
+                    "YouTube rate-limit persisted on %s after %s cooldown(s). "
+                    "Leaving this video and keeping the queue moving.",
+                    video_id,
+                    self._cooldown_rounds,
                 )
-                raise RateLimitAbort(self._abort_reason)
+                return
 
 
 # Shared by all transfer worker threads in this process.

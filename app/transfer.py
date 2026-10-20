@@ -20,7 +20,13 @@ from app.bunny import (
     FOLDER_VIDEOS,
     BunnyStream,
 )
-from app.config import Settings, switch_youtube_proxy, youtube_proxy_label, youtube_proxy_url
+from app.config import (
+    Settings,
+    reset_youtube_proxy,
+    switch_youtube_proxy,
+    youtube_proxy_label,
+    youtube_proxy_url,
+)
 from app.models import Creator, PlaylistItem, Short, Video
 from app.thumbnails import (
     transfer_playlist_thumbnails,
@@ -452,19 +458,6 @@ def download_video(settings: Settings, video: Video, output_dir: Path) -> Path:
         )
     tried_exits: set[str] = set()
 
-    def _skip_unavailable_video() -> None:
-        streak = DOWNLOAD_GUARD.note_unavailable_streak(video.youtube_video_id)
-        if streak >= 3:
-            DOWNLOAD_GUARD.abort_run(
-                "Three videos in a row were Video unavailable after switching "
-                "NordVPN host. Pausing so the transfer can restart after a cooldown."
-            )
-        raise HostsExhausted(
-            "Video unavailable for "
-            f"{video.youtube_video_id} after trying another NordVPN host. "
-            "Skipping it so the rest of the queue can continue."
-        )
-
     def _switch_exit() -> bool:
         nxt = switch_youtube_proxy(tried_exits)
         if not nxt:
@@ -475,6 +468,59 @@ def download_video(settings: Settings, video: Video, output_dir: Path) -> Path:
             youtube_proxy_label(nxt),
         )
         return True
+
+    def _is_exit_failure(exc: BaseException) -> bool:
+        """Bot-check, HTTP 429, or a dead SOCKS exit — try the next NordVPN host."""
+        if is_youtube_bot_check(exc) or is_youtube_rate_limited(exc):
+            return True
+        text = str(exc).lower()
+        return any(
+            token in text
+            for token in (
+                "unable to connect to proxy",
+                "proxyerror",
+                "socks",
+                "connection refused",
+                "network is unreachable",
+                "no route to host",
+                "timed out",
+                "timeout",
+                "connection reset",
+                "407",
+            )
+        )
+
+    def _after_all_hosts(reason: str) -> None:
+        """Every SOCKS exit failed. Retry once from the first host, then skip this video."""
+        nonlocal released
+        if not released:
+            DOWNLOAD_GUARD.release(ok=False)
+            released = True
+        fails = DOWNLOAD_GUARD.note_hosts_exhausted(video.youtube_video_id)
+        reset_youtube_proxy()
+        tried_exits.clear()
+        give_up = max(1, int(settings.transfer_same_video_host_fails))
+        if fails < give_up:
+            DOWNLOAD_GUARD.pause_briefly(
+                180,
+                reason=(
+                    f"{reason} All SOCKS hosts were tried for {video.youtube_video_id}. "
+                    f"Retry {fails}/{give_up} from the first host."
+                ),
+            )
+            return
+        DOWNLOAD_GUARD.note_unavailable_streak(video.youtube_video_id)
+        DOWNLOAD_GUARD.pause_briefly(
+            60,
+            reason=(
+                f"{reason} Skipping {video.youtube_video_id} and continuing "
+                "on a fresh SOCKS host."
+            ),
+        )
+        raise HostsExhausted(
+            f"{reason} {video.youtube_video_id} failed on every SOCKS host "
+            f"({fails} time(s)). Skipping it and continuing the queue."
+        )
 
     while True:
         DOWNLOAD_GUARD.raise_if_aborted()
@@ -554,23 +600,9 @@ def download_video(settings: Settings, video: Video, output_dir: Path) -> Path:
                     listed_h = _ytdlp_probe_max_height(opts, page_url=download_url)
                 except Exception as exc:
                     last_error = exc
-                    if is_youtube_rate_limited(exc):
-                        rate_limited = True
-                        log.warning(
-                            "YouTube rate-limit (HTTP 429) while probing %s; "
-                            "stopping further client plans",
-                            video.youtube_video_id,
-                        )
-                        break
-                    anonymous_blocked = not with_cookies and (
-                        is_youtube_bot_check(exc) or is_youtube_rate_limited(exc)
-                    )
-                    if anonymous_blocked:
-                        guest_blocked = True
-                        # Guest ios/tv probes are sent without cookies and often
-                        # bot-check. That must not abort the queue: keep the
-                        # cookie plan's formats, or try the next cookie plan.
-                        if best_plan is not None:
+                    if _is_exit_failure(exc):
+                        if best_plan is not None and not with_cookies:
+                            guest_blocked = True
                             log.warning(
                                 "Anonymous format probe blocked for %s; "
                                 "keeping cookie probe result %sp (skip remaining plans)",
@@ -578,23 +610,22 @@ def download_video(settings: Settings, video: Video, output_dir: Path) -> Path:
                                 best_probe_height,
                             )
                             break
+                        if _switch_exit():
+                            retry_on_new_exit = True
+                            break
+                        _after_all_hosts(
+                            "YouTube or the SOCKS exit blocked the format probe."
+                        )
+                        retry_on_new_exit = True
+                        break
+                    anonymous_blocked = not with_cookies and is_youtube_bot_check(exc)
+                    if anonymous_blocked:
+                        guest_blocked = True
                         log.warning(
                             "Anonymous format probe blocked for %s; skipping guest plan",
                             video.youtube_video_id,
                         )
                         continue
-                    if is_youtube_bot_check(exc) or is_youtube_rate_limited(exc):
-                        if _switch_exit():
-                            retry_on_new_exit = True
-                            break
-                        if is_youtube_bot_check(exc):
-                            DOWNLOAD_GUARD.release(ok=False)
-                            released = True
-                            DOWNLOAD_GUARD.trip_bot_check(
-                                settings, video_id=video.youtube_video_id
-                            )
-                        rate_limited = True
-                        break
                     message = str(exc).lower()
                     is_403 = "403" in message or "forbidden" in message
                     if is_403:
@@ -649,19 +680,11 @@ def download_video(settings: Settings, video: Video, output_dir: Path) -> Path:
                 if not released:
                     DOWNLOAD_GUARD.release(ok=False)
                     released = True
-                if cookie_unavailable or guest_blocked:
-                    DOWNLOAD_GUARD.pause_briefly(
-                        120,
-                        reason=(
-                            f"YouTube returned HTTP 429 while {video.youtube_video_id} "
-                            "was already unavailable."
-                        ),
-                    )
-                    _skip_unavailable_video()
-                if last_error and is_youtube_rate_limited(last_error):
-                    DOWNLOAD_GUARD.trip_rate_limit(
-                        settings, video_id=video.youtube_video_id
-                    )
+                if _switch_exit():
+                    continue
+                _after_all_hosts(
+                    "YouTube rate-limited this SOCKS exit."
+                )
                 continue
 
             if best_plan is None:
@@ -669,10 +692,12 @@ def download_video(settings: Settings, video: Video, output_dir: Path) -> Path:
                     if not released:
                         DOWNLOAD_GUARD.release(ok=False)
                         released = True
-                    # One other NordVPN exit is enough. More guest probes collect 429s.
-                    if not tried_exits and _switch_exit():
+                    if _switch_exit():
                         continue
-                    _skip_unavailable_video()
+                    _after_all_hosts(
+                        "Video unavailable on this SOCKS exit."
+                    )
+                    continue
                 if (
                     cdn_403_plans >= 2
                     and cookiefile is not None
@@ -682,14 +707,8 @@ def download_video(settings: Settings, video: Video, output_dir: Path) -> Path:
                             DOWNLOAD_GUARD.release(ok=False)
                             released = True
                         continue
-                    DOWNLOAD_GUARD.release(ok=False)
-                    released = True
-                    log.error(
-                        "Repeated googlevideo 403 for %s — rotating cookies / short cooldown",
-                        video.youtube_video_id,
-                    )
-                    DOWNLOAD_GUARD.trip_bot_check(
-                        settings, video_id=video.youtube_video_id
+                    _after_all_hosts(
+                        "Repeated googlevideo 403 on this SOCKS exit."
                     )
                     continue
                 raise RuntimeError(
@@ -745,17 +764,14 @@ def download_video(settings: Settings, video: Video, output_dir: Path) -> Path:
                     return filepath
                 except Exception as exc:
                     last_error = exc
-                    if is_youtube_bot_check(exc) or is_youtube_rate_limited(exc):
+                    if _is_exit_failure(exc):
                         if _switch_exit():
                             retry_on_new_exit = True
                             break
-                        if is_youtube_bot_check(exc):
-                            DOWNLOAD_GUARD.release(ok=False)
-                            released = True
-                            DOWNLOAD_GUARD.trip_bot_check(
-                                settings, video_id=video.youtube_video_id
-                            )
-                        rate_limited = True
+                        _after_all_hosts(
+                            "Download failed on this SOCKS exit."
+                        )
+                        retry_on_new_exit = True
                         break
                     message = str(exc).lower()
                     is_403 = "403" in message or "forbidden" in message
@@ -785,12 +801,11 @@ def download_video(settings: Settings, video: Video, output_dir: Path) -> Path:
                 if not released:
                     DOWNLOAD_GUARD.release(ok=False)
                     released = True
-                if last_error and is_youtube_rate_limited(last_error):
-                    if _switch_exit():
-                        continue
-                    DOWNLOAD_GUARD.trip_rate_limit(
-                        settings, video_id=video.youtube_video_id
-                    )
+                if _switch_exit():
+                    continue
+                _after_all_hosts(
+                    "YouTube rate-limited this SOCKS exit during download."
+                )
                 continue
 
             if (
@@ -804,14 +819,8 @@ def download_video(settings: Settings, video: Video, output_dir: Path) -> Path:
                         DOWNLOAD_GUARD.release(ok=False)
                         released = True
                     continue
-                DOWNLOAD_GUARD.release(ok=False)
-                released = True
-                log.error(
-                    "Repeated googlevideo 403 for %s — rotating cookies / short cooldown",
-                    video.youtube_video_id,
-                )
-                DOWNLOAD_GUARD.trip_bot_check(
-                    settings, video_id=video.youtube_video_id
+                _after_all_hosts(
+                    "Repeated googlevideo 403 during download."
                 )
                 continue
 
