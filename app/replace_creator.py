@@ -6,7 +6,7 @@ from sqlalchemy.orm import Session
 
 from app.bunny import BunnyStream
 from app.config import Settings
-from app.models import Creator, Playlist, PlaylistItem, Podcast, Short, Video
+from app.models import Creator, Playlist, PlaylistItem, Podcast, PodcastEpisode, Short, Video
 from app.utils import channel_handle, normalize_channel_url
 
 log = logging.getLogger(__name__)
@@ -29,6 +29,11 @@ def clear_creator_media(
     shorts = session.query(Short).filter(Short.creator_row_id == creator.id).all()
     playlists = session.query(Playlist).filter(Playlist.creator_row_id == creator.id).all()
     podcasts = session.query(Podcast).filter(Podcast.creator_row_id == creator.id).all()
+    episodes = (
+        session.query(PodcastEpisode)
+        .filter(PodcastEpisode.creator_row_id == creator.id)
+        .all()
+    )
     items = (
         session.query(PlaylistItem)
         .filter(PlaylistItem.creator_row_id == creator.id)
@@ -37,7 +42,7 @@ def clear_creator_media(
 
     bunny_ids = [
         row.bunny_path
-        for row in (*videos, *shorts, *items)
+        for row in (*videos, *shorts, *items, *episodes)
         if row.bunny_path
     ]
     bunny_deleted = 0
@@ -57,6 +62,9 @@ def clear_creator_media(
     session.query(Video).filter(
         Video.creator_row_id == creator.id
     ).delete(synchronize_session="fetch")
+    session.query(PodcastEpisode).filter(
+        PodcastEpisode.creator_row_id == creator.id
+    ).delete(synchronize_session="fetch")
     session.query(Podcast).filter(
         Podcast.creator_row_id == creator.id
     ).delete(synchronize_session="fetch")
@@ -68,6 +76,7 @@ def clear_creator_media(
         "playlists": len(playlists),
         "playlist_items": len(items),
         "podcasts": len(podcasts),
+        "podcast_episodes": len(episodes),
         "bunny_deleted": bunny_deleted,
     }
 

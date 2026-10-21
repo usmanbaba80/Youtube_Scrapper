@@ -7,7 +7,7 @@ from urllib.parse import urlparse
 import requests
 from sqlalchemy.orm import Session, joinedload
 
-from app.config import Settings
+from app.config import PODCAST_CATEGORY_ID, Settings
 from app.models import Creator, Playlist, PlaylistItem, Short, Video
 from app.storage import BunnyStorage
 from app.utils import bunny_creator_key, normalize_channel_ids, parse_media_types
@@ -237,7 +237,15 @@ def transfer_playlist_thumbnails(
     failed = 0
     skipped = 0
 
-    pq = session.query(Playlist).options(joinedload(Playlist.creator))
+    pq = (
+        session.query(Playlist)
+        .options(joinedload(Playlist.creator))
+        .filter(
+            Playlist.creator_row_id.notin_(
+                session.query(Creator.id).filter(Creator.category_id == PODCAST_CATEGORY_ID)
+            )
+        )
+    )
     if not force:
         pq = pq.filter(
             (Playlist.bunny_thumbnail_url.is_(None)) | (Playlist.bunny_thumbnail_url == "")
@@ -447,6 +455,13 @@ def transfer_thumbnails(
             .filter(PlaylistItem.transfer_status == "uploaded")
             .filter(PlaylistItem.reuse_source == "none")
             .filter(PlaylistItem.thumbnail_url.isnot(None), PlaylistItem.thumbnail_url != "")
+            .filter(
+                PlaylistItem.creator_row_id.notin_(
+                    session.query(Creator.id).filter(
+                        Creator.category_id == PODCAST_CATEGORY_ID
+                    )
+                )
+            )
         )
         if not force:
             iq = iq.filter(

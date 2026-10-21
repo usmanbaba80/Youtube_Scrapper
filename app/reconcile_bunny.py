@@ -13,7 +13,7 @@ from app.bunny import (
     FOLDER_VIDEOS,
     BunnyStream,
 )
-from app.config import Settings
+from app.config import PODCAST_CATEGORY_ID, Settings
 from app.models import Creator, PlaylistItem, Short, Video
 from app.thumbnails import try_upload_thumbnail_after_transfer
 from app.transfer import stream_creator_key
@@ -249,7 +249,7 @@ def reconcile_bunny(
                 dry_run=dry_run,
                 stats=stats,
             )
-        if "playlists" in kinds:
+        if "playlists" in kinds and creator.category_id != PODCAST_CATEGORY_ID:
             _reconcile_creator_media(
                 session,
                 bunny,

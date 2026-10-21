@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import re
 import threading
 import time
 from pathlib import Path
@@ -24,10 +25,20 @@ _BOT_CHECK_MARKERS = (
 )
 
 
+_ANSI_RE = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
+
+
+def plain_yt_error(exc: BaseException | str, limit: int = 300) -> str:
+    """One log line, without yt-dlp terminal color codes."""
+    text = _ANSI_RE.sub("", str(exc))
+    text = " ".join(text.split())
+    return text[:limit]
+
+
 def _yt_error_text(exc: BaseException | str) -> str:
     """Lowercase and fold YouTube's curly apostrophes so markers match."""
     return (
-        str(exc)
+        plain_yt_error(exc, limit=4000)
         .lower()
         .replace("\u2019", "'")
         .replace("\u2018", "'")
@@ -305,6 +316,7 @@ class YoutubeDownloadGuard:
         """
         self.configure(settings)
         self.raise_if_aborted()
+        announced = False
 
         while True:
             self.raise_if_aborted()
@@ -318,16 +330,18 @@ class YoutubeDownloadGuard:
                 wait = max(wait_cd, wait_gap)
                 if wait <= 0:
                     break
-                reason = "rate-limit cooldown" if wait_cd >= wait_gap else "download delay"
-                log.info(
-                    "YouTube %s: waiting %.0fs before next download "
-                    "(cookie=%s, rounds=%s/%s)",
-                    reason,
-                    wait,
-                    self._cookies.describe() if self._cookies else "none",
-                    self._cooldown_rounds,
-                    settings.rate_limit_max_cooldowns,
-                )
+                if not announced:
+                    reason = "rate-limit cooldown" if wait_cd >= wait_gap else "download delay"
+                    log.info(
+                        "YouTube %s: waiting %.0fs before next download "
+                        "(cookie=%s, rounds=%s/%s)",
+                        reason,
+                        wait,
+                        self._cookies.describe() if self._cookies else "none",
+                        self._cooldown_rounds,
+                        settings.rate_limit_max_cooldowns,
+                    )
+                    announced = True
             # Sleep outside the lock so other threads can observe the same wait.
             time.sleep(min(wait, 30.0))
 
@@ -339,9 +353,12 @@ class YoutubeDownloadGuard:
             self._slot.release()
             raise
 
-    def release(self, *, ok: bool) -> None:
+    def release(self, *, ok: bool, impose_gap: bool = True) -> None:
         with self._lock:
-            self._last_download_end = time.time()
+            # A dead proxy never reached YouTube. Starting the 8s gap there
+            # only delays the next NordVPN exit.
+            if impose_gap:
+                self._last_download_end = time.time()
         self._slot.release()
 
     def trip_rate_limit(self, settings, *, video_id: str) -> None:

@@ -67,6 +67,10 @@ class Creator(Base):
         back_populates="creator",
         foreign_keys="Playlist.creator_row_id",
     )
+    podcasts: Mapped[list["Podcast"]] = relationship(
+        back_populates="creator",
+        foreign_keys="Podcast.creator_row_id",
+    )
 
 
 class Video(Base):
@@ -224,6 +228,117 @@ class Playlist(Base):
         foreign_keys="PlaylistItem.playlist_row_id",
         cascade="all, delete-orphan",
     )
+
+
+class Podcast(Base):
+    """
+    Podcast shows from a channel Podcasts tab.
+
+    Each row is one show (YouTube stores the show as a playlist id).
+    """
+
+    __tablename__ = "podcasts"
+    __table_args__ = (
+        UniqueConstraint("creator_row_id", "youtube_podcast_id", name="uq_creator_yt_podcast"),
+        UniqueConstraint("podcast_id", name="uq_podcast_id"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    creator_row_id: Mapped[int] = mapped_column(ForeignKey("creators.id"), index=True)
+    category_id: Mapped[int] = mapped_column(Integer, index=True)
+    creator_id: Mapped[int] = mapped_column(Integer, index=True)
+    # D{category}{creator}{serial:02d}  e.g. D110001
+    podcast_id: Mapped[str] = mapped_column(String(32), index=True)
+    youtube_podcast_id: Mapped[str] = mapped_column(String(64), index=True)
+    url: Mapped[str] = mapped_column(String(500))
+    podcast_rank: Mapped[int] = mapped_column(Integer)
+
+    title: Mapped[str | None] = mapped_column(Text, nullable=True)
+    description: Mapped[str | None] = mapped_column(Text, nullable=True)
+    published_at: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    episode_count: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    thumbnail_url: Mapped[str | None] = mapped_column(String(1000), nullable=True)
+    bunny_thumbnail_path: Mapped[str | None] = mapped_column(String(1000), nullable=True)
+    bunny_thumbnail_url: Mapped[str | None] = mapped_column(String(1000), nullable=True)
+    metadata_json: Mapped[str | None] = mapped_column(Text, nullable=True)
+    metadata_status: Mapped[str] = mapped_column(String(32), default="pending", index=True)
+    metadata_error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    metadata_fetched_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+    creator: Mapped[Creator] = relationship(
+        back_populates="podcasts",
+        foreign_keys=[creator_row_id],
+    )
+    episodes: Mapped[list["PodcastEpisode"]] = relationship(
+        back_populates="podcast",
+        foreign_keys="PodcastEpisode.podcast_row_id",
+        cascade="all, delete-orphan",
+    )
+
+
+class PodcastEpisode(Base):
+    """
+    One episode inside a podcast show.
+
+    YouTube stores the show as a playlist, so an episode is a playlist video.
+    If that YouTube id is already in this creator's videos or shorts, the row
+    links to it and skips a second download. Otherwise it uploads on its own.
+    """
+
+    __tablename__ = "podcast_episodes"
+    __table_args__ = (
+        UniqueConstraint(
+            "podcast_row_id",
+            "position",
+            name="uq_podcast_episode_position",
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    podcast_row_id: Mapped[int] = mapped_column(ForeignKey("podcasts.id"), index=True)
+    creator_row_id: Mapped[int] = mapped_column(ForeignKey("creators.id"), index=True)
+    position: Mapped[int] = mapped_column(Integer)
+    youtube_video_id: Mapped[str] = mapped_column(String(16), index=True)
+    url: Mapped[str] = mapped_column(String(500))
+
+    video_row_id: Mapped[int | None] = mapped_column(
+        ForeignKey("videos.id"), nullable=True, index=True
+    )
+    short_row_id: Mapped[int | None] = mapped_column(
+        ForeignKey("shorts.id"), nullable=True, index=True
+    )
+    # video | short | none
+    reuse_source: Mapped[str] = mapped_column(String(16), default="none", index=True)
+
+    title: Mapped[str | None] = mapped_column(Text, nullable=True)
+    description: Mapped[str | None] = mapped_column(Text, nullable=True)
+    published_at: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    duration_iso: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    duration_seconds: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    thumbnail_url: Mapped[str | None] = mapped_column(String(1000), nullable=True)
+    bunny_thumbnail_path: Mapped[str | None] = mapped_column(String(1000), nullable=True)
+    bunny_thumbnail_url: Mapped[str | None] = mapped_column(String(1000), nullable=True)
+    metadata_json: Mapped[str | None] = mapped_column(Text, nullable=True)
+    metadata_status: Mapped[str] = mapped_column(String(32), default="pending", index=True)
+    metadata_error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    metadata_fetched_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+    transfer_status: Mapped[str] = mapped_column(String(32), default="pending", index=True)
+    local_path: Mapped[str | None] = mapped_column(String(1000), nullable=True)
+    bunny_path: Mapped[str | None] = mapped_column(String(1000), nullable=True)
+    bunny_url: Mapped[str | None] = mapped_column(String(1000), nullable=True)
+    file_size: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    transfer_error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    uploaded_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+    podcast: Mapped[Podcast] = relationship(
+        back_populates="episodes",
+        foreign_keys=[podcast_row_id],
+    )
+    video: Mapped[Video | None] = relationship(foreign_keys=[video_row_id])
+    short: Mapped[Short | None] = relationship(foreign_keys=[short_row_id])
 
 
 class PlaylistItem(Base):

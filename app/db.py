@@ -1,15 +1,18 @@
 from __future__ import annotations
 
+import logging
 from collections.abc import Iterator
 from contextlib import contextmanager
 from pathlib import Path
 
-from sqlalchemy import create_engine, event
+from sqlalchemy import create_engine, event, text
 from sqlalchemy.engine import Engine
 from sqlalchemy.orm import Session, sessionmaker
 
 from app.config import Settings
 from app.models import Base
+
+log = logging.getLogger(__name__)
 
 
 def _sqlite_connect(engine: Engine) -> None:
@@ -100,23 +103,50 @@ def _migrate_sqlite_playlist_item_columns(engine) -> None:
 
 
 def _migrate_count_columns_to_bigint(engine) -> None:
-    """Widen view/like/comment/file_size columns past PostgreSQL INTEGER max."""
+    """Widen view/like/comment/file_size columns past PostgreSQL INTEGER max.
+
+    Skips columns that are already BIGINT. Repeating ALTER TYPE takes an
+    exclusive table lock and deadlocks a transfer or scrape that is reading
+    those tables.
+    """
     if engine.dialect.name != "postgresql":
         return
-    alters = [
-        "ALTER TABLE videos ALTER COLUMN view_count TYPE BIGINT",
-        "ALTER TABLE videos ALTER COLUMN like_count TYPE BIGINT",
-        "ALTER TABLE videos ALTER COLUMN comment_count TYPE BIGINT",
-        "ALTER TABLE videos ALTER COLUMN file_size TYPE BIGINT",
-        "ALTER TABLE shorts ALTER COLUMN view_count TYPE BIGINT",
-        "ALTER TABLE shorts ALTER COLUMN like_count TYPE BIGINT",
-        "ALTER TABLE shorts ALTER COLUMN comment_count TYPE BIGINT",
-        "ALTER TABLE shorts ALTER COLUMN file_size TYPE BIGINT",
-        "ALTER TABLE playlist_items ALTER COLUMN file_size TYPE BIGINT",
-    ]
-    with engine.begin() as conn:
-        for sql in alters:
-            conn.exec_driver_sql(sql)
+    targets = (
+        ("videos", "view_count"),
+        ("videos", "like_count"),
+        ("videos", "comment_count"),
+        ("videos", "file_size"),
+        ("shorts", "view_count"),
+        ("shorts", "like_count"),
+        ("shorts", "comment_count"),
+        ("shorts", "file_size"),
+        ("playlist_items", "file_size"),
+        ("podcast_episodes", "file_size"),
+    )
+    for table, column in targets:
+        try:
+            with engine.begin() as conn:
+                conn.exec_driver_sql("SET lock_timeout = '3s'")
+                row = conn.execute(
+                    text(
+                        "SELECT data_type FROM information_schema.columns "
+                        "WHERE table_schema = 'public' "
+                        "AND table_name = :table AND column_name = :column"
+                    ),
+                    {"table": table, "column": column},
+                ).fetchone()
+                if row is None or row[0] == "bigint":
+                    continue
+                conn.exec_driver_sql(
+                    f"ALTER TABLE {table} ALTER COLUMN {column} TYPE BIGINT"
+                )
+        except Exception:
+            log.warning(
+                "Skipped bigint migration for %s.%s because the table is in use",
+                table,
+                column,
+                exc_info=True,
+            )
 
 
 def reset_database(settings: Settings) -> Path:

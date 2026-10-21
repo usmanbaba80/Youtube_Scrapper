@@ -3,7 +3,6 @@ from __future__ import annotations
 import logging
 import re
 import shutil
-import sys
 import time
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -16,18 +15,20 @@ from yt_dlp import YoutubeDL
 
 from app.bunny import (
     FOLDER_PLAYLISTS,
+    FOLDER_PODCASTS,
     FOLDER_SHORTS,
     FOLDER_VIDEOS,
     BunnyStream,
 )
 from app.config import (
+    PODCAST_CATEGORY_ID,
     Settings,
     reset_youtube_proxy,
     switch_youtube_proxy,
     youtube_proxy_label,
     youtube_proxy_url,
 )
-from app.models import Creator, PlaylistItem, Short, Video
+from app.models import Creator, PlaylistItem, PodcastEpisode, Short, Video
 from app.thumbnails import (
     transfer_playlist_thumbnails,
     try_upload_thumbnail_after_transfer,
@@ -45,6 +46,7 @@ from app.ytdlp_guard import (
     RateLimitAbort,
     is_youtube_rate_limited,
     is_youtube_unavailable,
+    plain_yt_error,
 )
 
 try:
@@ -264,6 +266,9 @@ def _ytdlp_download_opts(
         "noplaylist": True,
         "ignoreerrors": False,
         "retries": 5,
+        # A dead SOCKS exit fails the same way on every retry. The outer loop
+        # switches NordVPN hosts; do not burn 3 webpage + 3 API attempts here.
+        "extractor_retries": 0,
         # Fail fast on HLS 403 storms instead of 10×30s per fragment × N fragments.
         "fragment_retries": 2,
         "file_access_retries": 3,
@@ -275,9 +280,12 @@ def _ytdlp_download_opts(
         },
         "concurrent_fragment_downloads": 1,
         "overwrites": True,
-        "noprogress": False,
-        "quiet": False,
+        # Progress lines are one per fragment. On a server they land in
+        # pipeline.log / stderr and fill the disk (Errno 28).
+        "noprogress": True,
+        "quiet": True,
         "no_warnings": False,
+        "no_color": True,
         "restrictfilenames": True,
         "remote_components": ["ejs:github"],
         "match_filter": _reject_live_or_premiere,
@@ -387,14 +395,18 @@ def _max_listed_height(info: dict) -> int:
 
 
 class _YtdlpLogCapture:
-    """Record yt-dlp lines and still print them. HTTP 429 often arrives only as a warning."""
+    """Keep a few yt-dlp lines in memory. HTTP 429 often arrives only as a warning.
+
+    Do not mirror them to stderr. A redirected stderr file is what fills the disk.
+    """
 
     def __init__(self) -> None:
         self.messages: list[str] = []
 
     def _keep(self, message: str) -> None:
-        self.messages.append(message)
-        print(message, file=sys.stderr, flush=True)
+        if len(self.messages) >= 40:
+            return
+        self.messages.append(plain_yt_error(message, limit=500))
 
     def debug(self, message: str) -> None:
         text = str(message)
@@ -409,10 +421,66 @@ class _YtdlpLogCapture:
         self._keep(f"WARNING: {message}")
 
     def error(self, message: str) -> None:
-        self._keep(f"ERROR: {message}")
+        text = str(message)
+        if not text.startswith("ERROR:"):
+            text = f"ERROR: {text}"
+        self._keep(text)
 
     def joined(self) -> str:
         return "\n".join(self.messages)
+
+
+_MIN_FREE_BYTES = 2 * 1024 * 1024 * 1024
+_DISK_FULL_PAUSE = (
+    "Paused: no space left on device. "
+    "Free space under temp_downloads/ and logs/pipeline.log, then re-run."
+)
+
+
+def _is_disk_full(exc: BaseException | str) -> bool:
+    errno = getattr(exc, "errno", None)
+    if errno in {28, 112}:
+        return True
+    text = str(exc).lower()
+    return "no space left" in text or "errno 28" in text
+
+
+def _disk_full_error(video_id: str) -> RuntimeError:
+    return RuntimeError(
+        f"No space left on device while downloading {video_id}. {_DISK_FULL_PAUSE}"
+    )
+
+
+def _require_free_disk(path: Path, video_id: str) -> None:
+    """Refuse to start a download that would fill the last free blocks."""
+    target = path if path.exists() else path.parent
+    try:
+        free = shutil.disk_usage(target).free
+    except OSError:
+        return
+    if free >= _MIN_FREE_BYTES:
+        return
+    free_mb = free // (1024 * 1024)
+    need_mb = _MIN_FREE_BYTES // (1024 * 1024)
+    raise RuntimeError(
+        f"No space left on device for {video_id}: {free_mb} MiB free, "
+        f"need at least {need_mb} MiB. {_DISK_FULL_PAUSE}"
+    )
+
+
+def _cleanup_partials(output_dir: Path, video_id: str) -> None:
+    """Drop unfinished yt-dlp files so a full disk can recover a little space."""
+    if not output_dir.is_dir():
+        return
+    for path in output_dir.glob(f"{video_id}*"):
+        if not path.is_file():
+            continue
+        suffixes = "".join(path.suffixes).lower()
+        if ".part" in suffixes or suffixes.endswith(".ytdl") or suffixes.endswith(".temp"):
+            try:
+                path.unlink()
+            except OSError:
+                pass
 
 
 def _ytdlp_probe_max_height(
@@ -423,9 +491,11 @@ def _ytdlp_probe_max_height(
     """List formats only (no media download). Returns best short-edge height."""
     probe_opts = dict(opts)
     probe_opts["skip_download"] = True
-    # No pre-download sleep when we are only listing formats.
+    # No pauses while listing formats. sleep_interval_requests is the
+    # "Sleeping 1.5 seconds" line between a failed webpage and the API call.
     probe_opts["sleep_interval"] = 0
     probe_opts["max_sleep_interval"] = 0
+    probe_opts["sleep_interval_requests"] = 0
     capture = _YtdlpLogCapture()
     probe_opts["logger"] = capture
     try:
@@ -457,6 +527,9 @@ def download_video(settings: Settings, video: Video, output_dir: Path) -> Path:
             "(Video unavailable on another host). Continuing with the queue."
         )
     tried_exits: set[str] = set()
+    # One no-cookie web_embedded probe per video. Repeating it on every
+    # SOCKS exit is what produces HTTP 429.
+    guest_embed_attempted = False
 
     def _switch_exit() -> bool:
         nxt = switch_youtube_proxy(tried_exits)
@@ -469,20 +542,31 @@ def download_video(settings: Settings, video: Video, output_dir: Path) -> Path:
         )
         return True
 
+    def _is_dead_proxy(exc: BaseException) -> bool:
+        """The NordVPN exit itself failed. The request never reached YouTube."""
+        text = str(exc).lower()
+        return any(
+            token in text
+            for token in (
+                "socks",
+                "proxyerror",
+                "unable to connect to proxy",
+                "connection refused",
+                "network is unreachable",
+                "no route to host",
+            )
+        )
+
     def _is_exit_failure(exc: BaseException) -> bool:
         """Bot-check, HTTP 429, or a dead SOCKS exit — try the next NordVPN host."""
         if is_youtube_bot_check(exc) or is_youtube_rate_limited(exc):
+            return True
+        if _is_dead_proxy(exc):
             return True
         text = str(exc).lower()
         return any(
             token in text
             for token in (
-                "unable to connect to proxy",
-                "proxyerror",
-                "socks",
-                "connection refused",
-                "network is unreachable",
-                "no route to host",
                 "timed out",
                 "timeout",
                 "connection reset",
@@ -522,7 +606,19 @@ def download_video(settings: Settings, video: Video, output_dir: Path) -> Path:
             f"({fails} time(s)). Skipping it and continuing the queue."
         )
 
+    def _skip_unavailable(reason: str) -> None:
+        """Playability status will not change on the next US SOCKS exit."""
+        nonlocal released
+        if not released:
+            DOWNLOAD_GUARD.release(ok=False)
+            released = True
+        DOWNLOAD_GUARD.note_unavailable_streak(video.youtube_video_id)
+        raise HostsExhausted(
+            f"{reason} Skipping {video.youtube_video_id} and continuing the queue."
+        )
+
     while True:
+        _require_free_disk(output_dir, video.youtube_video_id)
         DOWNLOAD_GUARD.raise_if_aborted()
         cookiefile = DOWNLOAD_GUARD.acquire(settings)
         use_cookies = bool(cookiefile or settings.cookies_from_browser)
@@ -569,7 +665,18 @@ def download_video(settings: Settings, video: Video, output_dir: Path) -> Path:
             cookie_unavailable = False
             guest_blocked = False
             retry_on_new_exit = False
+            # A dead SOCKS exit never reached YouTube, so the 8s download gap
+            # only delays the next host.
+            skip_download_gap = False
+            # Cookie "Video unavailable" is a playability status, not a dead
+            # exit. Try web_embedded once without cookies, then skip the video
+            # instead of walking every SOCKS host and waiting 180s.
+            only_guest_embed = False
             for plan_i, (clients, with_cookies) in enumerate(unique_plans):
+                if only_guest_embed and (
+                    with_cookies or clients != ["web_embedded"] or guest_embed_attempted
+                ):
+                    continue
                 plan_cookies = cookiefile if with_cookies else None
                 opts = _ytdlp_download_opts(
                     settings,
@@ -596,10 +703,15 @@ def download_video(settings: Settings, video: Video, output_dir: Path) -> Path:
                     plan_i + 1,
                     len(unique_plans),
                 )
+                if not with_cookies and clients == ["web_embedded"]:
+                    guest_embed_attempted = True
                 try:
                     listed_h = _ytdlp_probe_max_height(opts, page_url=download_url)
                 except Exception as exc:
                     last_error = exc
+                    if _is_disk_full(exc):
+                        _cleanup_partials(output_dir, video.youtube_video_id)
+                        raise _disk_full_error(video.youtube_video_id) from exc
                     if _is_exit_failure(exc):
                         if best_plan is not None and not with_cookies:
                             guest_blocked = True
@@ -612,11 +724,13 @@ def download_video(settings: Settings, video: Video, output_dir: Path) -> Path:
                             break
                         if _switch_exit():
                             retry_on_new_exit = True
+                            skip_download_gap = _is_dead_proxy(exc)
                             break
                         _after_all_hosts(
                             "YouTube or the SOCKS exit blocked the format probe."
                         )
                         retry_on_new_exit = True
+                        skip_download_gap = _is_dead_proxy(exc)
                         break
                     anonymous_blocked = not with_cookies and is_youtube_bot_check(exc)
                     if anonymous_blocked:
@@ -630,20 +744,39 @@ def download_video(settings: Settings, video: Video, output_dir: Path) -> Path:
                     is_403 = "403" in message or "forbidden" in message
                     if is_403:
                         cdn_403_plans += 1
-                    if with_cookies and is_youtube_unavailable(exc):
-                        cookie_unavailable = True
-                        if tried_exits:
+                    if is_youtube_unavailable(exc):
+                        if with_cookies:
+                            cookie_unavailable = True
+                            if guest_embed_attempted:
+                                log.warning(
+                                    "Cookie clients say Video unavailable for %s "
+                                    "and the no-cookie probe already ran. Skipping it.",
+                                    video.youtube_video_id,
+                                )
+                                _skip_unavailable(
+                                    "Video unavailable on cookie clients."
+                                )
                             log.warning(
-                                "Cookie clients still say Video unavailable for %s "
-                                "after a host switch; skipping guest probes to avoid HTTP 429",
+                                "Cookie clients say Video unavailable for %s. "
+                                "Trying one no-cookie web_embedded probe.",
                                 video.youtube_video_id,
                             )
-                            break
+                            only_guest_embed = True
+                            continue
+                        if clients == ["web_embedded"] and cookie_unavailable:
+                            log.warning(
+                                "No-cookie web_embedded also says Video unavailable "
+                                "for %s. Skipping it.",
+                                video.youtube_video_id,
+                            )
+                            _skip_unavailable(
+                                "Video unavailable on cookie and guest clients."
+                            )
                     log.warning(
                         "Format probe failed for %s with %s (%s); trying next plan",
                         video.youtube_video_id,
                         ",".join(clients),
-                        str(exc)[:300],
+                        plain_yt_error(exc),
                     )
                     continue
 
@@ -672,7 +805,7 @@ def download_video(settings: Settings, video: Video, output_dir: Path) -> Path:
 
             if retry_on_new_exit:
                 if not released:
-                    DOWNLOAD_GUARD.release(ok=False)
+                    DOWNLOAD_GUARD.release(ok=False, impose_gap=not skip_download_gap)
                     released = True
                 continue
 
@@ -688,16 +821,13 @@ def download_video(settings: Settings, video: Video, output_dir: Path) -> Path:
                 continue
 
             if best_plan is None:
-                if cookie_unavailable and (guest_blocked or tried_exits):
-                    if not released:
-                        DOWNLOAD_GUARD.release(ok=False)
-                        released = True
-                    if _switch_exit():
-                        continue
-                    _after_all_hosts(
-                        "Video unavailable on this SOCKS exit."
+                if cookie_unavailable and (
+                    not guest_embed_attempted
+                    or is_youtube_unavailable(last_error or "")
+                ):
+                    _skip_unavailable(
+                        "Video unavailable for this video."
                     )
-                    continue
                 if (
                     cdn_403_plans >= 2
                     and cookiefile is not None
@@ -764,14 +894,19 @@ def download_video(settings: Settings, video: Video, output_dir: Path) -> Path:
                     return filepath
                 except Exception as exc:
                     last_error = exc
+                    if _is_disk_full(exc):
+                        _cleanup_partials(output_dir, video.youtube_video_id)
+                        raise _disk_full_error(video.youtube_video_id) from exc
                     if _is_exit_failure(exc):
                         if _switch_exit():
                             retry_on_new_exit = True
+                            skip_download_gap = _is_dead_proxy(exc)
                             break
                         _after_all_hosts(
                             "Download failed on this SOCKS exit."
                         )
                         retry_on_new_exit = True
+                        skip_download_gap = _is_dead_proxy(exc)
                         break
                     message = str(exc).lower()
                     is_403 = "403" in message or "forbidden" in message
@@ -786,14 +921,14 @@ def download_video(settings: Settings, video: Video, output_dir: Path) -> Path:
                         attempt,
                         attempts,
                         video.youtube_video_id,
-                        exc,
+                        plain_yt_error(exc),
                         sleep_for,
                     )
                     time.sleep(sleep_for)
 
             if retry_on_new_exit:
                 if not released:
-                    DOWNLOAD_GUARD.release(ok=False)
+                    DOWNLOAD_GUARD.release(ok=False, impose_gap=not skip_download_gap)
                     released = True
                 continue
 
@@ -1060,6 +1195,16 @@ def download_videos(
                     session.commit()
                     log.error(
                         "Download run paused after YouTube rate-limit on %s",
+                        video.youtube_video_id,
+                    )
+                    return downloaded, failed
+                if _is_disk_full(exc):
+                    _cleanup_partials(folder, video.youtube_video_id)
+                    _reset_job_to_pending(video, reason=str(exc))
+                    session.commit()
+                    log.error(
+                        "Download run paused: no space left on device (%s). "
+                        "Free temp_downloads/ and logs/pipeline.log, then re-run.",
                         video.youtube_video_id,
                     )
                     return downloaded, failed
@@ -1424,6 +1569,23 @@ def _run_transfer_job(settings: Settings, job: _TransferJob) -> dict:
             "local_path": kept,
         }
     except Exception as exc:
+        if _is_disk_full(exc):
+            _cleanup_partials(job.output_dir, job.youtube_video_id)
+            kept = None
+            if (
+                local_path is not None
+                and local_path.exists()
+                and ".part" not in local_path.name
+            ):
+                kept = str(local_path.resolve())
+            return {
+                "ok": False,
+                "disk_full": True,
+                "db_id": job.db_id,
+                "youtube_video_id": job.youtube_video_id,
+                "error": str(exc)[:2000],
+                "local_path": kept,
+            }
         kept = None
         if local_path is not None and local_path.exists():
             kept = str(local_path.resolve())
@@ -1469,6 +1631,34 @@ def _cancel_remaining_transfer_jobs(
         log.exception("Failed to reset pending jobs after rate-limit abort")
 
 
+def _pause_transfer_for_disk(
+    session: Session,
+    futures: dict,
+    row,
+    result: dict,
+    *,
+    model,
+    label: str,
+) -> None:
+    """Stop the queue. These rows are not bad videos; the disk is full."""
+    reason = (result.get("error") or _DISK_FULL_PAUSE)[:2000]
+    _reset_job_to_pending(row, reason=reason)
+    if result.get("local_path"):
+        row.local_path = result.get("local_path")
+    try:
+        session.commit()
+    except Exception:
+        session.rollback()
+        log.exception("Failed to pause %s transfer after disk full", label)
+        return
+    _cancel_remaining_transfer_jobs(session, futures, model=model, reason=reason)
+    log.error(
+        "Stopping %s transfer: disk is full (%s). Remaining jobs left pending.",
+        label,
+        result.get("youtube_video_id"),
+    )
+
+
 def transfer_videos(
     session: Session,
     settings: Settings,
@@ -1498,6 +1688,7 @@ def transfer_videos(
     do_videos = media_types is None or "videos" in media_types
     do_shorts = media_types is None or "shorts" in media_types
     do_playlists = media_types is None or "playlists" in media_types
+    do_podcasts = media_types is None or "podcasts" in media_types
     log.info(
         "Transfer media filter: %s%s",
         "all" if media_types is None else ",".join(sorted(media_types)),
@@ -1614,6 +1805,19 @@ def transfer_videos(
                     except Exception as exc:
                         video = session.get(Video, job.db_id) or video_by_id.get(job.db_id)
                         if video is not None:
+                            if _is_disk_full(exc):
+                                _pause_transfer_for_disk(
+                                    session,
+                                    futures,
+                                    video,
+                                    {
+                                        "error": str(exc),
+                                        "youtube_video_id": job.youtube_video_id,
+                                    },
+                                    model=Video,
+                                    label="video",
+                                )
+                                break
                             if isinstance(exc, RateLimitAbort) or is_youtube_rate_limited(exc):
                                 _reset_job_to_pending(video, reason=str(exc))
                                 try:
@@ -1663,15 +1867,26 @@ def transfer_videos(
                             )
                             break
 
+                        if result.get("disk_full"):
+                            _pause_transfer_for_disk(
+                                session,
+                                futures,
+                                video,
+                                result,
+                                model=Video,
+                                label="video",
+                            )
+                            break
+
                         if result.get("hosts_exhausted"):
                             video.transfer_status = "failed"
                             video.transfer_error = result.get("error")
                             video.local_path = result.get("local_path")
                             failed += 1
                             log.error(
-                                "Skipping %s after Video unavailable on every host. "
-                                "Continuing with the rest of the queue.",
+                                "Skipping %s. Continuing with the rest of the queue. %s",
                                 job.youtube_video_id,
+                                result.get("error"),
                             )
                             session.commit()
                             continue
@@ -1762,7 +1977,19 @@ def transfer_videos(
         log.info("Skipping playlists (media filter)")
         p_up, p_fail = 0, 0
 
-    return uploaded + s_up + p_up, failed + s_fail + p_fail, 0
+    if do_podcasts:
+        d_up, d_fail = transfer_podcast_episodes(
+            session,
+            settings,
+            retry_failed=retry_failed or force,
+            force=force,
+            channel_ids=channel_ids,
+        )
+    else:
+        log.info("Skipping podcasts (media filter)")
+        d_up, d_fail = 0, 0
+
+    return uploaded + s_up + p_up + d_up, failed + s_fail + p_fail + d_fail, 0
 
 
 def transfer_shorts(
@@ -1878,15 +2105,25 @@ def transfer_shorts(
                         job.youtube_video_id,
                     )
                     break
+                if result.get("disk_full"):
+                    _pause_transfer_for_disk(
+                        session,
+                        futures,
+                        short,
+                        result,
+                        model=Short,
+                        label="shorts",
+                    )
+                    break
                 if result.get("hosts_exhausted"):
                     short.transfer_status = "failed"
                     short.transfer_error = result.get("error")
                     short.local_path = result.get("local_path")
                     failed += 1
                     log.error(
-                        "Skipping short %s after Video unavailable on every host. "
-                        "Continuing with the rest of the queue.",
+                        "Skipping short %s. Continuing with the rest of the queue. %s",
                         job.youtube_video_id,
+                        result.get("error"),
                     )
                     session.commit()
                     continue
@@ -2158,15 +2395,25 @@ def transfer_playlist_items(
                         job.youtube_video_id,
                     )
                     break
+                if result.get("disk_full"):
+                    _pause_transfer_for_disk(
+                        session,
+                        futures,
+                        item,
+                        result,
+                        model=PlaylistItem,
+                        label="playlist",
+                    )
+                    break
                 if result.get("hosts_exhausted"):
                     item.transfer_status = "failed"
                     item.transfer_error = result.get("error")
                     item.local_path = result.get("local_path")
                     failed += 1
                     log.error(
-                        "Skipping playlist item %s after Video unavailable on every host. "
-                        "Continuing with the rest of the queue.",
+                        "Skipping playlist item %s. Continuing with the rest of the queue. %s",
                         job.youtube_video_id,
+                        result.get("error"),
                     )
                     session.commit()
                     continue
@@ -2233,6 +2480,11 @@ def _eligible_transfer_playlist_items(
     channel_ids = normalize_channel_ids(channel_ids, channel_id=channel_id)
     if channel_ids is not None:
         query = query.filter(PlaylistItem.creator_row_id.in_(channel_ids))
+    query = query.filter(
+        PlaylistItem.creator_row_id.notin_(
+            session.query(Creator.id).filter(Creator.category_id == PODCAST_CATEGORY_ID)
+        )
+    )
 
     selected: list[PlaylistItem] = []
     old_stream_ids: list[str] = []
@@ -2282,6 +2534,260 @@ def _eligible_transfer_playlist_items(
         )
         log.info(
             "Force re-transfer: reset %s uploaded playlist item(s)",
+            len(old_stream_ids),
+        )
+
+    return selected
+
+
+def transfer_podcast_episodes(
+    session: Session,
+    settings: Settings,
+    *,
+    retry_failed: bool = False,
+    force: bool = False,
+    channel_ids: list[int] | None = None,
+    channel_id: int | None = None,
+) -> tuple[int, int]:
+    """Upload podcast episodes that are not already a video or short."""
+    channel_ids = normalize_channel_ids(channel_ids, channel_id=channel_id)
+    items = _eligible_transfer_podcast_episodes(
+        session,
+        retry_failed=retry_failed or force,
+        force=force,
+        channel_ids=channel_ids,
+    )
+    stale_ids = list(session.info.pop("force_delete_stream_ids", []) or [])
+    session.commit()
+    if force and stale_ids:
+        bunny_cleanup = BunnyStream(settings)
+        for vid in stale_ids:
+            bunny_cleanup.delete_video(vid)
+    if not items:
+        log.info("No podcast episodes waiting to transfer")
+        return 0, 0
+
+    creators = {
+        creator.id: creator
+        for creator in session.query(Creator)
+        .filter(Creator.id.in_({item.creator_row_id for item in items}))
+        .all()
+    }
+    bunny = BunnyStream(settings)
+    collections: dict[int, str] = {}
+    skipped: set[int] = set()
+    for cid in {item.creator_row_id for item in items}:
+        creator = creators.get(cid)
+        if creator is None:
+            skipped.add(cid)
+            continue
+        stream_key = stream_creator_key(creator)
+        try:
+            collections[cid] = bunny.ensure_folder_collection(stream_key, FOLDER_PODCASTS)
+        except Exception as exc:
+            log.exception("Failed Stream collection for %s/podcasts", stream_key)
+            skipped.add(cid)
+            for item in items:
+                if item.creator_row_id == cid:
+                    item.transfer_status = "failed"
+                    item.transfer_error = f"Collection error: {exc}"[:2000]
+    session.commit()
+
+    jobs: list[_TransferJob] = []
+    job_item: dict[int, PodcastEpisode] = {}
+    for item in items:
+        if item.creator_row_id in skipped:
+            continue
+        creator = creators.get(item.creator_row_id)
+        collection_id = collections.get(item.creator_row_id)
+        if creator is None or not collection_id:
+            continue
+        folder = creator_dir(settings, creator, FOLDER_PODCASTS)
+        existing = Path(item.local_path) if item.local_path else None
+        if existing and not existing.exists():
+            existing = None
+        item.transfer_status = "downloading" if existing is None else "uploading"
+        item.transfer_error = None
+        job = _TransferJob(
+            db_id=item.id,
+            youtube_video_id=item.youtube_video_id,
+            url=item.url,
+            title=item.title,
+            app_video_id=item.youtube_video_id,
+            collection_id=collection_id,
+            output_dir=folder,
+            existing_local=existing,
+        )
+        jobs.append(job)
+        job_item[item.id] = item
+    session.commit()
+    if not jobs:
+        return 0, len(skipped)
+
+    uploaded = 0
+    failed = 0
+    workers = min(settings.transfer_concurrency, len(jobs))
+    log.info(
+        "Transferring %s podcast episodes with concurrency=%s -> Creator/podcasts",
+        len(jobs),
+        workers,
+    )
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        futures = {pool.submit(_run_transfer_job, settings, job): job for job in jobs}
+        abort_reason = (
+            "Paused: YouTube rate-limit. Re-run with --retry-failed after cooldown "
+            "or after rotating cookies in YTDLP_COOKIES_DIR."
+        )
+        for future in as_completed(futures):
+            job = futures[future]
+            result = future.result()
+            item = session.get(PodcastEpisode, job.db_id) or job_item.get(job.db_id)
+            if item is None:
+                continue
+            try:
+                if result.get("rate_limit_abort"):
+                    _reset_job_to_pending(
+                        item, reason=result.get("error") or abort_reason
+                    )
+                    item.local_path = result.get("local_path")
+                    session.commit()
+                    _cancel_remaining_transfer_jobs(
+                        session, futures, model=PodcastEpisode, reason=abort_reason
+                    )
+                    log.error(
+                        "Stopping podcast transfer after YouTube rate-limit on %s",
+                        job.youtube_video_id,
+                    )
+                    break
+                if result.get("disk_full"):
+                    _pause_transfer_for_disk(
+                        session,
+                        futures,
+                        item,
+                        result,
+                        model=PodcastEpisode,
+                        label="podcast",
+                    )
+                    break
+                if result.get("hosts_exhausted"):
+                    item.transfer_status = "failed"
+                    item.transfer_error = result.get("error")
+                    item.local_path = result.get("local_path")
+                    failed += 1
+                    session.commit()
+                    continue
+                if result["ok"]:
+                    bunny_info = result["bunny"]
+                    item.file_size = result.get("file_size")
+                    item.bunny_path = bunny_info["video_id"]
+                    item.bunny_url = bunny_info.get("hls_url") or bunny_info["play_url"]
+                    item.transfer_status = "uploaded"
+                    item.uploaded_at = utcnow()
+                    item.local_path = None
+                    item.transfer_error = None
+                    creator = session.get(Creator, item.creator_row_id)
+                    if creator is not None:
+                        try_upload_thumbnail_after_transfer(
+                            settings,
+                            session,
+                            creator=creator,
+                            row=item,
+                            kind="podcast-episodes",
+                            public_id=item.youtube_video_id,
+                        )
+                    uploaded += 1
+                else:
+                    item.transfer_status = "failed"
+                    item.transfer_error = result.get("error")
+                    item.local_path = result.get("local_path")
+                    failed += 1
+                session.commit()
+            except Exception:
+                session.rollback()
+                failed += 1
+                log.exception(
+                    "Failed to persist podcast episode transfer for %s",
+                    job.youtube_video_id,
+                )
+
+    return uploaded, failed
+
+
+def _eligible_transfer_podcast_episodes(
+    session: Session,
+    *,
+    retry_failed: bool,
+    force: bool = False,
+    channel_ids: list[int] | None = None,
+    channel_id: int | None = None,
+) -> list[PodcastEpisode]:
+    """Episodes that still need their own download. Reused video/short rows stay skipped."""
+    statuses = ["pending", "failed", "downloaded", "downloading", "uploading"]
+    if force:
+        statuses = statuses + ["uploaded"]
+    elif not retry_failed:
+        statuses = ["pending", "downloaded", "downloading", "uploading"]
+
+    query = (
+        session.query(PodcastEpisode)
+        .filter(
+            PodcastEpisode.reuse_source == "none",
+            PodcastEpisode.transfer_status.in_(statuses),
+        )
+        .order_by(PodcastEpisode.creator_row_id.asc(), PodcastEpisode.position.asc())
+    )
+    channel_ids = normalize_channel_ids(channel_ids, channel_id=channel_id)
+    if channel_ids is not None:
+        query = query.filter(PodcastEpisode.creator_row_id.in_(channel_ids))
+
+    selected: list[PodcastEpisode] = []
+    old_stream_ids: list[str] = []
+    for item in query.all():
+        if force and item.transfer_status == "uploaded":
+            old = _reset_uploaded_for_force(item, kind="podcast_episodes")
+            if old:
+                old_stream_ids.append(old)
+
+        if item.bunny_path and item.transfer_status != "uploaded":
+            if force:
+                old = _reset_uploaded_for_force(item, kind="podcast_episodes")
+                if old:
+                    old_stream_ids.append(old)
+            else:
+                item.transfer_status = "uploaded"
+                item.transfer_error = None
+                item.local_path = None
+                continue
+
+        local = Path(item.local_path) if item.local_path else None
+        local_ok = bool(local and local.exists())
+
+        if item.transfer_status in {"downloading", "uploading"}:
+            if local_ok:
+                item.transfer_status = "downloaded"
+            else:
+                item.transfer_status = "failed" if retry_failed else "pending"
+                item.local_path = None
+                item.transfer_error = "Interrupted transfer; will retry"
+                local_ok = False
+
+        if item.transfer_status == "downloaded" and not local_ok:
+            item.transfer_status = "pending"
+            item.local_path = None
+            local_ok = False
+
+        if item.transfer_status == "failed" and not retry_failed and not force:
+            continue
+
+        if item.transfer_status in {"pending", "failed", "downloaded"}:
+            selected.append(item)
+
+    if force and old_stream_ids:
+        session.info["force_delete_stream_ids"] = (
+            list(session.info.get("force_delete_stream_ids", [])) + old_stream_ids
+        )
+        log.info(
+            "Force re-transfer: reset %s uploaded podcast episode(s)",
             len(old_stream_ids),
         )
 

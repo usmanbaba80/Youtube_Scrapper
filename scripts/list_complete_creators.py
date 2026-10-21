@@ -1,4 +1,4 @@
-"""List creators where all videos, shorts, and playlist items are uploaded."""
+"""List creators where videos, shorts, playlist items, and podcasts are done."""
 
 from __future__ import annotations
 
@@ -12,9 +12,9 @@ sys.path.insert(0, str(ROOT))
 
 from sqlalchemy import func
 
-from app.config import load_settings
+from app.config import PODCAST_CATEGORY_ID, load_settings
 from app.db import make_engine, make_session_factory, session_scope
-from app.models import Creator, PlaylistItem, Short, Video
+from app.models import Creator, PlaylistItem, Podcast, PodcastEpisode, Short, Video
 
 
 def _counts_by_creator(session, model, *, extra_filters=(), uploaded_only: bool = False):
@@ -55,20 +55,52 @@ def main() -> int:
         )
         sh_tot = _counts_by_creator(session, Short)
         sh_up = _counts_by_creator(session, Short, uploaded_only=True)
-        p_tot = _counts_by_creator(session, PlaylistItem)
-        p_up = _counts_by_creator(session, PlaylistItem, uploaded_only=True)
+        # Category 5 (Podcasts - PodVerse) is scored on podcasts, not playlists.
+        not_podcast_category = PlaylistItem.creator_row_id.notin_(
+            session.query(Creator.id).filter(Creator.category_id == PODCAST_CATEGORY_ID)
+        )
+        p_tot = _counts_by_creator(
+            session, PlaylistItem, extra_filters=(not_podcast_category,)
+        )
+        p_up = _counts_by_creator(
+            session,
+            PlaylistItem,
+            extra_filters=(not_podcast_category,),
+            uploaded_only=True,
+        )
+        d_tot = _counts_by_creator(session, Podcast)
+        # An episode is done when its own file is uploaded, or it reuses a video/short.
+        e_tot = _counts_by_creator(session, PodcastEpisode)
+        e_done = _counts_by_creator(
+            session,
+            PodcastEpisode,
+            extra_filters=(
+                PodcastEpisode.transfer_status.in_(("uploaded", "skipped")),
+            ),
+        )
 
-        print("id    handle                          videos     shorts     playlist_items")
-        print("-" * 78)
+        header = (
+            f"{'id':4}  {'handle':<30}  {'videos':<10}  {'shorts':<10}  "
+            f"{'playlist_items':<16}  {'podcasts':<10}  episodes"
+        )
+        print(header)
+        print("-" * len(header))
         matched = 0
         for creator in creators:
             cid = creator.id
             vt, vu = v_tot.get(cid, 0), v_up.get(cid, 0)
             st, su = sh_tot.get(cid, 0), sh_up.get(cid, 0)
             pt, pu = p_tot.get(cid, 0), p_up.get(cid, 0)
-            if vt + st + pt == 0:
+            dt = d_tot.get(cid, 0)
+            et, eu = e_tot.get(cid, 0), e_done.get(cid, 0)
+            if vt + st + pt + dt + et == 0:
                 continue
-            is_complete = vt == vu and st == su and pt == pu
+            # A podcast show with no stored episodes is not finished yet.
+            if dt:
+                episodes_done = et > 0 and eu == et
+            else:
+                episodes_done = eu == et
+            is_complete = vt == vu and st == su and pt == pu and episodes_done
             if args.incomplete:
                 if is_complete:
                     continue
@@ -76,11 +108,16 @@ def main() -> int:
                 continue
             matched += 1
             handle = (creator.handle or creator.name or "")[:30]
+            ratio = f"{vu}/{vt}"
+            shorts_ratio = f"{su}/{st}"
+            items_ratio = f"{pu}/{pt}"
+            podcast_ratio = f"{dt}"
+            episode_ratio = f"{eu}/{et}"
             print(
-                f"{cid:4}  {handle:<30}  "
-                f"{vu}/{vt:<6}  {su}/{st:<6}  {pu}/{pt}"
+                f"{cid:4}  {handle:<30}  {ratio:<10}  {shorts_ratio:<10}  "
+                f"{items_ratio:<16}  {podcast_ratio:<10}  {episode_ratio}"
             )
-        print("-" * 78)
+        print("-" * len(header))
         label = "Incomplete" if args.incomplete else "Complete"
         print(f"{label} creators: {matched}")
     return 0

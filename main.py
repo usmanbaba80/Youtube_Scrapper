@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import argparse
 import logging
+import logging.handlers
+import shutil
 import sys
 from dataclasses import replace
 from pathlib import Path
@@ -24,15 +26,95 @@ from app.pipeline import (
 from app.utils import parse_channel_ids, parse_media_types
 
 
+_LOG_MAX_BYTES = 20 * 1024 * 1024
+_LOW_DISK_BYTES = 2 * 1024 * 1024 * 1024
+
+
+def _oserror_is_full(exc: OSError) -> bool:
+    if getattr(exc, "errno", None) in {28, 112}:
+        return True
+    return "no space left" in str(exc).lower()
+
+
+class _DiskSafeRotatingFileHandler(logging.handlers.RotatingFileHandler):
+    """Drop a log line when the disk is full instead of dumping a logging traceback."""
+
+    def emit(self, record: logging.LogRecord) -> None:
+        try:
+            super().emit(record)
+        except OSError as exc:
+            if not _oserror_is_full(exc):
+                raise
+
+
+class _DiskSafeStreamHandler(logging.StreamHandler):
+    def emit(self, record: logging.LogRecord) -> None:
+        try:
+            super().emit(record)
+        except OSError as exc:
+            if not _oserror_is_full(exc):
+                raise
+
+
+def _keep_log_tail(path: Path, keep: int) -> None:
+    """Shrink a huge log in place. Reading the tail first works even at 0 bytes free."""
+    size = path.stat().st_size
+    with path.open("rb") as handle:
+        handle.seek(max(0, size - keep))
+        tail = handle.read(keep)
+    newline = tail.find(b"\n")
+    if newline != -1 and newline < len(tail) - 1:
+        tail = tail[newline + 1 :]
+    with path.open("wb") as handle:
+        handle.write(tail)
+        handle.truncate()
+
+
+def _reclaim_log_space(logs_dir: Path, log_path: Path) -> None:
+    """A full disk makes every later log line throw Errno 28. Free the log first."""
+    try:
+        free = shutil.disk_usage(logs_dir).free
+    except OSError:
+        return
+    if free >= _LOW_DISK_BYTES:
+        return
+    try:
+        if log_path.is_file() and log_path.stat().st_size > _LOG_MAX_BYTES:
+            _keep_log_tail(log_path, _LOG_MAX_BYTES)
+        for backup in logs_dir.glob("pipeline.log.*"):
+            backup.unlink(missing_ok=True)
+    except OSError as exc:
+        try:
+            print(f"Could not shrink {log_path}: {exc}", file=sys.stderr)
+        except OSError:
+            pass
+        return
+    try:
+        print(
+            f"Disk had under 2 GiB free. Shrunk {log_path.name} so logging can continue. "
+            "Also clear temp_downloads/ if downloads still fail.",
+            file=sys.stderr,
+        )
+    except OSError:
+        pass
+
+
 def setup_logging() -> None:
     logs_dir = PROJECT_ROOT / "logs"
     logs_dir.mkdir(parents=True, exist_ok=True)
+    log_path = logs_dir / "pipeline.log"
+    _reclaim_log_space(logs_dir, log_path)
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
         handlers=[
-            logging.StreamHandler(),
-            logging.FileHandler(logs_dir / "pipeline.log", encoding="utf-8"),
+            _DiskSafeStreamHandler(),
+            _DiskSafeRotatingFileHandler(
+                log_path,
+                maxBytes=_LOG_MAX_BYTES,
+                backupCount=2,
+                encoding="utf-8",
+            ),
         ],
     )
 
@@ -71,9 +153,10 @@ def build_parser() -> argparse.ArgumentParser:
         "--media",
         type=str,
         help=(
-            "For scrape/transfer/thumbnails: only these media types — videos, shorts, playlists "
-            "(comma-separated). Default: all. Examples: --media shorts "
-            "or --media videos,playlists"
+            "For scrape, metadata, transfer, thumbnails, and reconcile-bunny: only these "
+            "media types — videos, shorts, playlists, podcasts (comma-separated). Default: all. "
+            "Category 5 (Podcasts - PodVerse) uses podcasts instead of playlists. "
+            "Examples: --media shorts or --media videos,playlists"
         ),
     )
     parser.add_argument(
@@ -120,13 +203,14 @@ def main() -> None:
 
     if media_types is not None and args.command not in {
         "scrape",
+        "metadata",
         "transfer",
         "thumbnails",
         "reconcile-bunny",
         "run",
     }:
         print(
-            "error: --media is only supported for scrape, transfer, thumbnails, reconcile-bunny, and run",
+            "error: --media is only supported for scrape, metadata, transfer, thumbnails, reconcile-bunny, and run",
             file=sys.stderr,
         )
         raise SystemExit(2)
@@ -171,6 +255,7 @@ def main() -> None:
                 retry_failed=args.retry_failed,
                 force=args.force,
                 channel_ids=channel_ids,
+                media_types=media_types,
             )
         elif args.command == "download":
             run_download(

@@ -95,13 +95,15 @@ _MEDIA_ALIASES = {
     "playlist-item": "playlists",
     "playlist-items": "playlists",
     "playlist_items": "playlists",
+    "podcast": "podcasts",
+    "podcasts": "podcasts",
 }
-ALL_MEDIA_TYPES = ("videos", "shorts", "playlists")
+ALL_MEDIA_TYPES = ("videos", "shorts", "playlists", "podcasts")
 
 
 def parse_media_types(raw: str | None) -> frozenset[str] | None:
     """
-    Parse ``--media`` values: ``videos``, ``shorts``, ``playlists``,
+    Parse ``--media`` values: ``videos``, ``shorts``, ``playlists``, ``podcasts``,
     or a comma list like ``videos,shorts``.
     Returns None when unset (meaning: all media types).
     """
@@ -117,7 +119,7 @@ def parse_media_types(raw: str | None) -> frozenset[str] | None:
         key = _MEDIA_ALIASES.get(part)
         if key is None:
             raise ValueError(
-                f"Invalid --media value {part!r}; expected videos, shorts, and/or playlists"
+                f"Invalid --media value {part!r}; expected videos, shorts, playlists, and/or podcasts"
             )
         selected.append(key)
     return frozenset(selected) or None
@@ -177,6 +179,13 @@ def build_playlist_id(category_id: int, creator_id: int, serial: int) -> str:
     if serial < 1 or serial > 99:
         raise ValueError(f"serial must be 1..99, got {serial}")
     return f"P{category_id}{creator_id}{serial:02d}"
+
+
+def build_podcast_id(category_id: int, creator_id: int, serial: int) -> str:
+    """D{category}{creator}{serial:02d} e.g. D510001."""
+    if serial < 1 or serial > 99:
+        raise ValueError(f"serial must be 1..99, got {serial}")
+    return f"D{category_id}{creator_id}{serial:02d}"
 
 
 # Backward-compatible alias

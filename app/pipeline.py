@@ -10,7 +10,16 @@ from app.config import Settings, reset_youtube_proxy
 from app.excel import load_excel
 from app.export_json import export_jsons
 from app.metadata import fetch_all_metadata
-from app.models import Category, Creator, Playlist, PlaylistItem, Short, Video
+from app.models import (
+    Category,
+    Creator,
+    Playlist,
+    PlaylistItem,
+    Podcast,
+    PodcastEpisode,
+    Short,
+    Video,
+)
 from app.scraper import scrape_all_creators
 from app.thumbnails import transfer_thumbnails
 from app.transfer import download_videos, transfer_videos, upload_videos
@@ -184,7 +193,13 @@ def run_all(
             media_types=media_types,
         )
         session.commit()
-        run_metadata(session, settings, retry_failed=retry_failed)
+        run_metadata(
+            session,
+            settings,
+            retry_failed=retry_failed,
+            channel_ids=channel_ids,
+            media_types=media_types,
+        )
         session.commit()
         run_transfer(
             session,
@@ -282,4 +297,47 @@ def print_status(session: Session) -> None:
     print(
         "  playlist metadata fetched:",
         session.query(func.count(Playlist.id)).filter(Playlist.metadata_status == "fetched").scalar(),
+    )
+
+    podcasts = session.query(func.count(Podcast.id)).scalar() or 0
+    print(f"Podcasts:   {podcasts}")
+    print(
+        "  metadata pending:",
+        session.query(func.count(Podcast.id)).filter(Podcast.metadata_status == "pending").scalar(),
+    )
+    print(
+        "  metadata fetched:",
+        session.query(func.count(Podcast.id)).filter(Podcast.metadata_status == "fetched").scalar(),
+    )
+    print(
+        "  metadata failed:",
+        session.query(func.count(Podcast.id)).filter(Podcast.metadata_status == "failed").scalar(),
+    )
+    print(
+        "  bunny thumbnails:",
+        session.query(func.count(Podcast.id))
+        .filter(Podcast.bunny_thumbnail_url.isnot(None), Podcast.bunny_thumbnail_url != "")
+        .scalar(),
+    )
+    episodes = session.query(func.count(PodcastEpisode.id)).scalar() or 0
+    print(f"Podcast episodes: {episodes}")
+    for status, count in _count_by(session, PodcastEpisode, PodcastEpisode.transfer_status):
+        print(f"  transfer {status or '(null)'}: {count}")
+    print(
+        "  episodes linked to videos:",
+        session.query(func.count(PodcastEpisode.id))
+        .filter(PodcastEpisode.reuse_source == "video")
+        .scalar(),
+    )
+    print(
+        "  episodes linked to shorts:",
+        session.query(func.count(PodcastEpisode.id))
+        .filter(PodcastEpisode.reuse_source == "short")
+        .scalar(),
+    )
+    print(
+        "  episodes unlinked:",
+        session.query(func.count(PodcastEpisode.id))
+        .filter(PodcastEpisode.reuse_source == "none")
+        .scalar(),
     )

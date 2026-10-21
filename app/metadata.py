@@ -7,9 +7,9 @@ import time
 import requests
 from sqlalchemy.orm import Session, joinedload
 
-from app.config import Settings
-from app.models import Creator, Playlist, PlaylistItem, Short, Video
-from app.utils import normalize_channel_ids, parse_iso8601_duration, utcnow
+from app.config import PODCAST_CATEGORY_ID, Settings
+from app.models import Creator, Playlist, PlaylistItem, Podcast, PodcastEpisode, Short, Video
+from app.utils import normalize_channel_ids, parse_iso8601_duration, parse_media_types, utcnow
 
 log = logging.getLogger(__name__)
 
@@ -199,6 +199,31 @@ def apply_playlist_item_metadata(item_row: PlaylistItem, item: dict) -> None:
     item_row.metadata_fetched_at = utcnow()
 
 
+def apply_podcast_metadata(podcast: Podcast, item: dict) -> None:
+    snippet = item.get("snippet") or {}
+    details = item.get("contentDetails") or {}
+    title, description = preferred_title_description(item)
+    podcast.title = title or podcast.title
+    podcast.description = description
+    podcast.published_at = snippet.get("publishedAt")
+    item_count = details.get("itemCount")
+    if item_count is not None:
+        podcast.episode_count = int(item_count)
+    podcast.thumbnail_url = _thumb_url(snippet) or podcast.thumbnail_url
+    podcast.metadata_json = json.dumps(item, ensure_ascii=False)
+    podcast.metadata_status = "fetched"
+    podcast.metadata_error = None
+    podcast.metadata_fetched_at = utcnow()
+
+
+def _exclude_podcast_category(query, model):
+    """Playlists are not used for Podcasts - PodVerse (category 5)."""
+    podcast_creators = query.session.query(Creator.id).filter(
+        Creator.category_id == PODCAST_CATEGORY_ID
+    )
+    return query.filter(model.creator_row_id.notin_(podcast_creators))
+
+
 def apply_playlist_metadata(playlist: Playlist, item: dict) -> None:
     snippet = item.get("snippet") or {}
     details = item.get("contentDetails") or {}
@@ -294,11 +319,24 @@ def fetch_all_metadata(
     force: bool = False,
     channel_ids: list[int] | None = None,
     channel_id: int | None = None,
+    media_types: frozenset[str] | set[str] | list[str] | str | None = None,
 ) -> tuple[int, int]:
     if not settings.youtube_api_key:
         raise RuntimeError("YOUTUBE_API_KEY is missing. Add it to .env")
 
     channel_ids = normalize_channel_ids(channel_ids, channel_id=channel_id)
+    if isinstance(media_types, str):
+        media_types = parse_media_types(media_types)
+    elif media_types is not None:
+        media_types = frozenset(media_types)
+    do_videos = media_types is None or "videos" in media_types
+    do_shorts = media_types is None or "shorts" in media_types
+    do_playlists = media_types is None or "playlists" in media_types
+    do_podcasts = media_types is None or "podcasts" in media_types
+    log.info(
+        "Metadata media filter: %s",
+        "all" if media_types is None else ",".join(sorted(media_types)),
+    )
     if force and not channel_ids:
         raise ValueError(
             "metadata --force requires --channel-id (creators.id) so only that creator is refreshed"
@@ -336,15 +374,17 @@ def fetch_all_metadata(
         return query
 
     # --- Long-form videos ---
-    videos = (
-        _scoped(
-            session.query(Video).options(joinedload(Video.creator)),
-            Video,
+    videos = []
+    if do_videos:
+        videos = (
+            _scoped(
+                session.query(Video).options(joinedload(Video.creator)),
+                Video,
+            )
+            .filter(Video.is_short.is_(False))
+            .order_by(Video.id.asc())
+            .all()
         )
-        .filter(Video.is_short.is_(False))
-        .order_by(Video.id.asc())
-        .all()
-    )
     if videos:
         ids = list(dict.fromkeys(video.youtube_video_id for video in videos))
         log.info("Fetching metadata for %s videos in batches of %s", len(ids), BATCH_SIZE)
@@ -362,18 +402,20 @@ def fetch_all_metadata(
                 if yt_channel_id:
                     video.creator.youtube_channel_id = yt_channel_id
             updated += 1
-    else:
+    elif do_videos:
         log.info("No videos waiting for metadata")
 
     # --- Shorts ---
-    shorts = (
-        _scoped(
-            session.query(Short).options(joinedload(Short.creator)),
-            Short,
+    shorts = []
+    if do_shorts:
+        shorts = (
+            _scoped(
+                session.query(Short).options(joinedload(Short.creator)),
+                Short,
+            )
+            .order_by(Short.id.asc())
+            .all()
         )
-        .order_by(Short.id.asc())
-        .all()
-    )
     if shorts:
         ids = list(dict.fromkeys(s.youtube_video_id for s in shorts))
         log.info("Fetching metadata for %s shorts", len(ids))
@@ -387,12 +429,14 @@ def fetch_all_metadata(
                 continue
             apply_short_metadata(short, item)
             updated += 1
-    else:
+    elif do_shorts:
         log.info("No shorts waiting for metadata")
 
     # Drop fake "shorts": channels without a Shorts tab can still return long-form
     # videoIds from /shorts browse JSON; /shorts/{id} then redirects to watch.
-    removed_fake = _purge_oversized_shorts(session, settings, channel_ids)
+    removed_fake = 0
+    if do_shorts:
+        removed_fake = _purge_oversized_shorts(session, settings, channel_ids)
     if removed_fake:
         log.info(
             "Removed %s fake shorts longer than %ss (not real YouTube Shorts)",
@@ -401,11 +445,14 @@ def fetch_all_metadata(
         )
 
     # --- Playlists (only if still pending; scrape often already filled them) ---
-    playlists = (
-        _scoped(session.query(Playlist), Playlist)
-        .order_by(Playlist.id.asc())
-        .all()
-    )
+    # Category 5 (Podcasts - PodVerse) has podcast shows instead of playlists.
+    playlists = []
+    if do_playlists:
+        playlists = (
+            _exclude_podcast_category(_scoped(session.query(Playlist), Playlist), Playlist)
+            .order_by(Playlist.id.asc())
+            .all()
+        )
     if playlists:
         ids = list(dict.fromkeys(p.youtube_playlist_id for p in playlists))
         log.info("Fetching metadata for %s playlists", len(ids))
@@ -419,16 +466,76 @@ def fetch_all_metadata(
                 continue
             apply_playlist_metadata(playlist, item)
             updated += 1
-    else:
+    elif do_playlists:
         log.info("No playlists waiting for metadata")
 
+    # --- Podcasts (Podcasts - PodVerse). YouTube stores each show as a playlist id. ---
+    podcasts = []
+    if do_podcasts:
+        podcasts = (
+            _scoped(session.query(Podcast), Podcast)
+            .order_by(Podcast.id.asc())
+            .all()
+        )
+    if podcasts:
+        ids = list(dict.fromkeys(podcast.youtube_podcast_id for podcast in podcasts))
+        log.info("Fetching metadata for %s podcasts", len(ids))
+        payload = _fetch_playlists_metadata(settings.youtube_api_key, ids)
+        for podcast in podcasts:
+            item = payload.get(podcast.youtube_podcast_id)
+            if not item:
+                podcast.metadata_status = "failed"
+                podcast.metadata_error = "Podcast not returned by YouTube Data API"
+                missing += 1
+                continue
+            apply_podcast_metadata(podcast, item)
+            updated += 1
+    elif do_podcasts:
+        log.info("No podcasts waiting for metadata")
+
+    # Podcast episodes not already covered by a video or short.
+    episode_items = []
+    if do_podcasts:
+        episode_query = session.query(PodcastEpisode).filter(
+            PodcastEpisode.reuse_source == "none"
+        )
+        if statuses is not None:
+            episode_query = episode_query.filter(
+                PodcastEpisode.metadata_status.in_(statuses)
+            )
+        if channel_ids is not None:
+            episode_query = episode_query.filter(
+                PodcastEpisode.creator_row_id.in_(channel_ids)
+            )
+        episode_items = episode_query.order_by(PodcastEpisode.id.asc()).all()
+    if episode_items:
+        ids = list(dict.fromkeys(row.youtube_video_id for row in episode_items))
+        log.info("Fetching metadata for %s podcast episodes", len(ids))
+        payload = fetch_videos_metadata(settings.youtube_api_key, ids)
+        for row in episode_items:
+            item = payload.get(row.youtube_video_id)
+            if not item:
+                row.metadata_status = "failed"
+                row.metadata_error = "Episode not returned by YouTube Data API"
+                missing += 1
+                continue
+            apply_playlist_item_metadata(row, item)
+            updated += 1
+    elif do_podcasts:
+        log.info("No podcast episodes waiting for metadata")
+
     # --- Playlist items NOT linked to videos/shorts ---
-    orphan_query = session.query(PlaylistItem).filter(PlaylistItem.reuse_source == "none")
-    if statuses is not None:
-        orphan_query = orphan_query.filter(PlaylistItem.metadata_status.in_(statuses))
-    if channel_ids is not None:
-        orphan_query = orphan_query.filter(PlaylistItem.creator_row_id.in_(channel_ids))
-    orphan_items = orphan_query.order_by(PlaylistItem.id.asc()).all()
+    orphan_items = []
+    if do_playlists:
+        orphan_query = _exclude_podcast_category(
+            session.query(PlaylistItem).filter(PlaylistItem.reuse_source == "none"),
+            PlaylistItem,
+        )
+        if statuses is not None:
+            orphan_query = orphan_query.filter(PlaylistItem.metadata_status.in_(statuses))
+        if channel_ids is not None:
+            orphan_query = orphan_query.filter(PlaylistItem.creator_row_id.in_(channel_ids))
+        orphan_items = orphan_query.order_by(PlaylistItem.id.asc()).all()
     if orphan_items:
         ids = list(dict.fromkeys(i.youtube_video_id for i in orphan_items))
         log.info(
@@ -445,20 +552,25 @@ def fetch_all_metadata(
                 continue
             apply_playlist_item_metadata(row, item)
             updated += 1
-    else:
+    elif do_playlists:
         log.info("No unlinked playlist items waiting for metadata")
 
     # Linked items copy the refreshed video/short text. No extra YouTube call.
-    reused_query = session.query(PlaylistItem).filter(
-        PlaylistItem.reuse_source.in_(["video", "short"])
-    )
-    if not force:
-        reused_query = reused_query.filter(
-            PlaylistItem.metadata_status.in_(["pending", "failed"])
+    reused = []
+    if do_playlists:
+        reused_query = _exclude_podcast_category(
+            session.query(PlaylistItem).filter(
+                PlaylistItem.reuse_source.in_(["video", "short"])
+            ),
+            PlaylistItem,
         )
-    if channel_ids is not None:
-        reused_query = reused_query.filter(PlaylistItem.creator_row_id.in_(channel_ids))
-    reused = reused_query.all()
+        if not force:
+            reused_query = reused_query.filter(
+                PlaylistItem.metadata_status.in_(["pending", "failed"])
+            )
+        if channel_ids is not None:
+            reused_query = reused_query.filter(PlaylistItem.creator_row_id.in_(channel_ids))
+        reused = reused_query.all()
     for row in reused:
         source = row.video if row.reuse_source == "video" else row.short
         if source is not None:

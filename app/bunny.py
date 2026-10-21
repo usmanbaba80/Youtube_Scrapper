@@ -11,13 +11,19 @@ from app.config import Settings
 log = logging.getLogger(__name__)
 
 STREAM_API = "https://video.bunnycdn.com"
+# urllib3 uses the connect timeout as the socket timeout while the file body
+# is sent. A 60s cap aborts a large PUT when Bunny accepts bytes slowly
+# ("The write operation timed out") and the partial Stream video is deleted.
+UPLOAD_WRITE_TIMEOUT_SECONDS = 600
+UPLOAD_ATTEMPTS = 3
 
 # Logical folders inside each creator (Stream collections are flat; we encode
 # hierarchy in the collection name as "CreatorName/videos", etc.)
 FOLDER_VIDEOS = "videos"
 FOLDER_SHORTS = "shorts"
 FOLDER_PLAYLISTS = "playlists"
-CREATOR_FOLDERS = (FOLDER_VIDEOS, FOLDER_SHORTS, FOLDER_PLAYLISTS)
+FOLDER_PODCASTS = "podcasts"
+CREATOR_FOLDERS = (FOLDER_VIDEOS, FOLDER_SHORTS, FOLDER_PLAYLISTS, FOLDER_PODCASTS)
 
 
 class _ProgressReader:
@@ -201,7 +207,7 @@ class BunnyStream:
         return collection_id
 
     def ensure_creator_folders(self, creator_key: str) -> dict[str, str]:
-        """Create/find videos, shorts, and playlists collections for a creator_id."""
+        """Create/find videos, shorts, playlists, and podcasts collections for a creator."""
         return {
             folder: self.ensure_folder_collection(creator_key, folder)
             for folder in CREATOR_FOLDERS
@@ -380,22 +386,7 @@ class BunnyStream:
         )
 
         try:
-            # No read timeout: large VODs can take 30–90+ minutes. The old 120s
-            # timeout aborted PUTs and left 0-byte Stream orphans in "processing".
-            with _ProgressReader(local_path, file_size, local_path.name) as body:
-                upload = self.session.put(
-                    self._url(f"videos/{video_id}"),
-                    data=body,
-                    headers={
-                        "Content-Type": "application/octet-stream",
-                        "Content-Length": str(file_size),
-                    },
-                    timeout=(60, None),
-                )
-            if upload.status_code not in {200, 201}:
-                raise RuntimeError(
-                    f"Stream upload failed ({upload.status_code}): {upload.text[:500]}"
-                )
+            self._put_video_file(video_id, local_path, file_size)
 
             # Bunny may report storageSize a few seconds after PUT returns.
             storage = 0
@@ -444,6 +435,42 @@ class BunnyStream:
             "embed_url": self.embed_url(video_id),
             "hls_url": self.hls_url(video_id),
         }
+
+    def _put_video_file(self, video_id: str, local_path: Path, file_size: int) -> None:
+        """PUT the file. Retry when a slow write times out; Bunny keeps the same video id."""
+        url = self._url(f"videos/{video_id}")
+        headers = {
+            "Content-Type": "application/octet-stream",
+            "Content-Length": str(file_size),
+        }
+        # No read timeout: a 1GB+ VOD can take a long time after the body is sent.
+        # The first number is also the Windows socket write timeout during the PUT.
+        timeout = (UPLOAD_WRITE_TIMEOUT_SECONDS, None)
+        last_error: Exception | None = None
+        for attempt in range(1, UPLOAD_ATTEMPTS + 1):
+            try:
+                with _ProgressReader(local_path, file_size, local_path.name) as body:
+                    upload = self.session.put(url, data=body, headers=headers, timeout=timeout)
+                if upload.status_code not in {200, 201}:
+                    raise RuntimeError(
+                        f"Stream upload failed ({upload.status_code}): {upload.text[:500]}"
+                    )
+                return
+            except requests.RequestException as exc:
+                last_error = exc
+                log.warning(
+                    "Upload attempt %s/%s failed for %s (%s): %s",
+                    attempt,
+                    UPLOAD_ATTEMPTS,
+                    local_path.name,
+                    video_id,
+                    exc,
+                )
+                if attempt >= UPLOAD_ATTEMPTS:
+                    raise
+                time.sleep(5 * attempt)
+        if last_error is not None:
+            raise last_error
 
     def embed_url(self, video_id: str) -> str:
         return f"https://iframe.mediadelivery.net/embed/{self.library_id}/{video_id}"

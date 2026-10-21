@@ -6,9 +6,10 @@ import time
 
 from sqlalchemy.orm import Session
 
-from app.config import Settings
-from app.models import Creator, Playlist, PlaylistItem, Short, Video
+from app.config import PODCAST_CATEGORY_ID, Settings
+from app.models import Creator, Playlist, PlaylistItem, Podcast, PodcastEpisode, Short, Video
 from app.playlists import fetch_channel_playlists, fetch_playlist_items
+from app.podcasts import fetch_channel_podcasts
 from app.popular import (
     detect_channel_tabs_and_id,
     fetch_channel_shorts,
@@ -17,6 +18,7 @@ from app.popular import (
 from app.utils import (
     normalize_channel_ids,
     build_playlist_id,
+    build_podcast_id,
     build_short_id,
     build_video_id,
     channel_handle,
@@ -408,6 +410,195 @@ def _store_playlists(
     return upserted, linked, unlinked
 
 
+def _clear_creator_playlists(session: Session, creator: Creator) -> tuple[int, int]:
+    """Drop this creator's playlists and items. Podcasts - PodVerse does not use them."""
+    items = (
+        session.query(PlaylistItem)
+        .filter(PlaylistItem.creator_row_id == creator.id)
+        .delete(synchronize_session="fetch")
+    )
+    playlists = (
+        session.query(Playlist)
+        .filter(Playlist.creator_row_id == creator.id)
+        .delete(synchronize_session="fetch")
+    )
+    session.flush()
+    return int(playlists or 0), int(items or 0)
+
+
+def _store_podcast_episodes(
+    session: Session,
+    settings: Settings,
+    creator: Creator,
+    podcast: Podcast,
+    *,
+    videos_by_yt: dict[str, Video],
+    shorts_by_yt: dict[str, Short],
+) -> tuple[int, int]:
+    """
+    Replace this show's episodes, same cap as playlist items.
+
+    Returns (linked, unlinked). Linked episodes reuse an existing video or short.
+    """
+    if not settings.youtube_api_key:
+        log.warning(
+            "Skipping episodes for podcast %r — YOUTUBE_API_KEY missing",
+            podcast.title,
+        )
+        return 0, 0
+
+    entries = fetch_playlist_items(
+        settings.youtube_api_key,
+        podcast.youtube_podcast_id,
+        limit=settings.max_playlist_items,
+        title=podcast.title,
+    )
+    session.query(PodcastEpisode).filter_by(podcast_row_id=podcast.id).delete(
+        synchronize_session="fetch"
+    )
+    session.flush()
+    seen_yt: set[str] = set()
+    position = 0
+    linked = 0
+    unlinked = 0
+    for entry in entries:
+        yt_id = entry["youtube_video_id"]
+        if yt_id in seen_yt:
+            continue
+        seen_yt.add(yt_id)
+        position += 1
+        reuse_source, video_row_id, short_row_id, transfer_status = _link_playlist_item(
+            videos_by_yt=videos_by_yt,
+            shorts_by_yt=shorts_by_yt,
+            youtube_video_id=yt_id,
+        )
+        if reuse_source == "none":
+            unlinked += 1
+            meta_status = "pending"
+            transfer_status = "pending"
+            transfer_error = "Podcast episode; upload to Creator/podcasts"
+        else:
+            linked += 1
+            meta_status = "reused"
+            transfer_status = "skipped"
+            transfer_error = f"Reuses {reuse_source} in Creator/{reuse_source}s; skip re-upload"
+        session.add(
+            PodcastEpisode(
+                podcast_row_id=podcast.id,
+                creator_row_id=creator.id,
+                position=position,
+                youtube_video_id=yt_id,
+                url=entry["url"],
+                video_row_id=video_row_id,
+                short_row_id=short_row_id,
+                reuse_source=reuse_source,
+                title=entry.get("title"),
+                description=entry.get("description"),
+                published_at=entry.get("published_at"),
+                thumbnail_url=entry.get("thumbnail_url"),
+                metadata_status=meta_status,
+                transfer_status=transfer_status,
+                transfer_error=transfer_error,
+            )
+        )
+    return linked, unlinked
+
+
+def _store_podcasts(
+    session: Session,
+    settings: Settings,
+    creator: Creator,
+    rows: list[dict],
+) -> int:
+    """Upsert podcast shows and their episodes. Returns how many shows were stored."""
+    existing = {
+        podcast.youtube_podcast_id: podcast
+        for podcast in session.query(Podcast).filter_by(creator_row_id=creator.id).all()
+    }
+    keep_ids = {row["youtube_podcast_id"] for row in rows}
+    for youtube_id, podcast in list(existing.items()):
+        if youtube_id not in keep_ids:
+            session.delete(podcast)
+            del existing[youtube_id]
+
+    claimed_ids = {
+        build_podcast_id(creator.category_id, creator.creator_id, rank)
+        for rank in range(1, len(rows) + 1)
+    }
+    for podcast in existing.values():
+        if podcast.podcast_id in claimed_ids or podcast.youtube_podcast_id in keep_ids:
+            podcast.podcast_id = f"tmp-d-{podcast.id}"
+    session.flush()
+
+    videos_by_yt = {
+        video.youtube_video_id: video
+        for video in session.query(Video).filter_by(creator_row_id=creator.id).all()
+    }
+    shorts_by_yt = {
+        short.youtube_video_id: short
+        for short in session.query(Short).filter_by(creator_row_id=creator.id).all()
+    }
+
+    stored = 0
+    for rank, row in enumerate(rows, start=1):
+        business_id = build_podcast_id(creator.category_id, creator.creator_id, rank)
+        podcast = existing.get(row["youtube_podcast_id"])
+        if podcast is None:
+            podcast = Podcast(
+                creator_row_id=creator.id,
+                category_id=creator.category_id,
+                creator_id=creator.creator_id,
+                podcast_id=business_id,
+                youtube_podcast_id=row["youtube_podcast_id"],
+                url=row["url"],
+                podcast_rank=rank,
+                title=row.get("title"),
+                episode_count=row.get("episode_count"),
+                thumbnail_url=row.get("thumbnail_url"),
+                metadata_status="pending",
+            )
+            session.add(podcast)
+            session.flush()
+            existing[row["youtube_podcast_id"]] = podcast
+        else:
+            podcast.podcast_rank = rank
+            podcast.podcast_id = business_id
+            podcast.category_id = creator.category_id
+            podcast.creator_id = creator.creator_id
+            podcast.url = row["url"]
+            podcast.title = row.get("title") or podcast.title
+            if row.get("episode_count") is not None:
+                podcast.episode_count = row["episode_count"]
+            podcast.thumbnail_url = row.get("thumbnail_url") or podcast.thumbnail_url
+        stored += 1
+        try:
+            linked, unlinked = _store_podcast_episodes(
+                session,
+                settings,
+                creator,
+                podcast,
+                videos_by_yt=videos_by_yt,
+                shorts_by_yt=shorts_by_yt,
+            )
+        except Exception:
+            log.exception(
+                "Failed fetching episodes for podcast %s (%s)",
+                row.get("title"),
+                row["youtube_podcast_id"],
+            )
+            linked = unlinked = 0
+        log.info(
+            "Storing podcast %s/%s: %r (reported %s, stored linked=%s unlinked=%s)",
+            rank,
+            len(rows),
+            row.get("title"),
+            row.get("episode_count"),
+            linked,
+            unlinked,
+        )
+    return stored
+
+
 def scrape_all_creators(
     session: Session,
     settings: Settings,
@@ -428,6 +619,7 @@ def scrape_all_creators(
     want_videos = media_types is None or "videos" in media_types
     want_shorts = media_types is None or "shorts" in media_types
     want_playlists = media_types is None or "playlists" in media_types
+    want_podcasts = media_types is None or "podcasts" in media_types
     log.info(
         "Scrape media filter: %s",
         "all" if media_types is None else ",".join(sorted(media_types)),
@@ -551,9 +743,18 @@ def scrape_all_creators(
                 failed += 1
                 continue
 
-            # --- Playlists ---
+            # --- Playlists (every category except Podcasts - PodVerse) ---
+            # Category 5 stores podcast shows instead, capped at 3 per channel.
             p_up = linked = unlinked = 0
-            if want_playlists and settings.max_playlists_per_channel > 0 and "playlists" in tabs:
+            d_up = 0
+            is_podcast_category = creator.category_id == PODCAST_CATEGORY_ID
+            if is_podcast_category and (want_playlists or want_podcasts):
+                log.info(
+                    "Skipping playlists for %s — category %s uses podcasts",
+                    creator_label,
+                    PODCAST_CATEGORY_ID,
+                )
+            elif want_playlists and settings.max_playlists_per_channel > 0 and "playlists" in tabs:
                 if not settings.youtube_api_key:
                     log.warning(
                         "Skipping playlists for %s — YOUTUBE_API_KEY missing",
@@ -600,9 +801,66 @@ def scrape_all_creators(
                 failed += 1
                 continue
 
-            if media_types is None and not items and shorts_count == 0 and p_up == 0:
+            # --- Podcasts (Podcasts - PodVerse only, max 3 shows) ---
+            if (
+                is_podcast_category
+                and want_podcasts
+                and settings.max_podcasts_per_channel > 0
+                and "podcasts" in tabs
+            ):
+                try:
+                    podcast_rows = fetch_channel_podcasts(
+                        creator.channel_url,
+                        limit=settings.max_podcasts_per_channel,
+                        tabs=tabs,
+                    )
+                    d_up = _store_podcasts(session, settings, creator, podcast_rows)
+                    removed_playlists, removed_items = _clear_creator_playlists(
+                        session, creator
+                    )
+                    if removed_playlists or removed_items:
+                        log.info(
+                            "Removed playlists for %s after podcast scrape: "
+                            "playlists=%s items=%s",
+                            creator_label,
+                            removed_playlists,
+                            removed_items,
+                        )
+                    session.commit()
+                    creator = session.get(Creator, creator_pk)
+                except Exception:
+                    session.rollback()
+                    creator = session.get(Creator, creator_pk)
+                    log.exception(
+                        "Podcast scrape failed for %s (continuing)",
+                        creator_label,
+                    )
+            elif is_podcast_category and want_podcasts and settings.max_podcasts_per_channel > 0:
+                log.info(
+                    "Skipping podcasts for %s — no Podcasts tab on channel",
+                    creator_label,
+                )
+            elif is_podcast_category and want_podcasts:
+                log.info(
+                    "Skipping podcasts for %s — MAX_PODCASTS_PER_CHANNEL=0",
+                    creator_label,
+                )
+            elif is_podcast_category:
+                log.info("Skipping podcasts for %s — media filter", creator_label)
+            elif want_podcasts and media_types is not None:
+                log.info(
+                    "Skipping podcasts for %s — only category %s uses podcasts",
+                    creator_label,
+                    PODCAST_CATEGORY_ID,
+                )
+
+            if creator is None:
+                failed += 1
+                continue
+
+            if media_types is None and not items and shorts_count == 0 and p_up == 0 and d_up == 0:
                 raise RuntimeError(
-                    "Nothing scraped: channel has no usable Videos/Shorts/Playlists content"
+                    "Nothing scraped: channel has no usable Videos/Shorts/Playlists/Podcasts content"
                 )
 
             creator.scrape_status = "done"
@@ -611,7 +869,7 @@ def scrape_all_creators(
             scraped += 1
             log.info(
                 "[%s/%s] %s (creator_id=%s): tabs=%s; videos=%s (+%s/-%s), shorts=%s (+%s/-%s), "
-                "playlists=%s (items linked=%s, unlinked=%s)",
+                "playlists=%s (items linked=%s, unlinked=%s), podcasts=%s",
                 index,
                 len(creators),
                 creator_label,
@@ -626,6 +884,7 @@ def scrape_all_creators(
                 p_up,
                 linked,
                 unlinked,
+                d_up,
             )
         except Exception as exc:
             session.rollback()
