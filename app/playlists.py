@@ -121,7 +121,7 @@ def fetch_playlist_items(
             "fields": (
                 "nextPageToken,"
                 "items(contentDetails/videoId,"
-                "snippet(title,description,localized,publishedAt,resourceId/videoId,thumbnails))"
+                "snippet(title,description,publishedAt,resourceId/videoId,thumbnails))"
             ),
         }
         if page_token:

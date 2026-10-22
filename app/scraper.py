@@ -506,6 +506,72 @@ def _store_podcast_episodes(
     return linked, unlinked
 
 
+def _refresh_stored_podcast_episodes(
+    session: Session,
+    settings: Settings,
+    creator: Creator,
+) -> int:
+    """
+    Store episodes for podcast shows already in the database.
+
+    Used when the channel page does not list a Podcasts tab, which happens
+    when YouTube returns a consent or bot page. Each show keeps at most
+    ``max_podcast_episodes`` episodes.
+    """
+    podcasts = (
+        session.query(Podcast)
+        .filter_by(creator_row_id=creator.id)
+        .order_by(Podcast.podcast_rank.asc(), Podcast.id.asc())
+        .all()
+    )
+    keep = podcasts[: settings.max_podcasts_per_channel]
+    for podcast in podcasts[settings.max_podcasts_per_channel :]:
+        session.delete(podcast)
+    if not keep:
+        return 0
+
+    videos_by_yt = {
+        video.youtube_video_id: video
+        for video in session.query(Video).filter_by(creator_row_id=creator.id).all()
+    }
+    shorts_by_yt = {
+        short.youtube_video_id: short
+        for short in session.query(Short).filter_by(creator_row_id=creator.id).all()
+    }
+    log.info(
+        "Refreshing episodes for %s stored podcast(s) on %s (max %s each)",
+        len(keep),
+        creator.name,
+        settings.max_podcast_episodes,
+    )
+    stored = 0
+    for podcast in keep:
+        try:
+            linked, unlinked = _store_podcast_episodes(
+                session,
+                settings,
+                creator,
+                podcast,
+                videos_by_yt=videos_by_yt,
+                shorts_by_yt=shorts_by_yt,
+            )
+        except Exception:
+            log.exception(
+                "Failed fetching episodes for podcast %s (%s)",
+                podcast.title,
+                podcast.youtube_podcast_id,
+            )
+            continue
+        stored += 1
+        log.info(
+            "Stored episodes for %r: linked=%s unlinked=%s",
+            podcast.title,
+            linked,
+            unlinked,
+        )
+    return stored
+
+
 def _store_podcasts(
     session: Session,
     settings: Settings,
@@ -809,15 +875,30 @@ def scrape_all_creators(
                 is_podcast_category
                 and want_podcasts
                 and settings.max_podcasts_per_channel > 0
-                and "podcasts" in tabs
             ):
                 try:
-                    podcast_rows = fetch_channel_podcasts(
-                        creator.channel_url,
-                        limit=settings.max_podcasts_per_channel,
-                        tabs=tabs,
-                    )
-                    d_up = _store_podcasts(session, settings, creator, podcast_rows)
+                    if "podcasts" in tabs:
+                        podcast_rows = fetch_channel_podcasts(
+                            creator.channel_url,
+                            limit=settings.max_podcasts_per_channel,
+                            tabs=tabs,
+                        )
+                        d_up = _store_podcasts(session, settings, creator, podcast_rows)
+                    else:
+                        if not tabs:
+                            log.warning(
+                                "No channel tabs detected for %s; "
+                                "fetching episodes from stored podcasts",
+                                creator_label,
+                            )
+                        d_up = _refresh_stored_podcast_episodes(
+                            session, settings, creator
+                        )
+                        if d_up == 0:
+                            log.info(
+                                "Skipping podcasts for %s — no Podcasts tab and no stored shows",
+                                creator_label,
+                            )
                     removed_playlists, removed_items = _clear_creator_playlists(
                         session, creator
                     )
@@ -838,11 +919,6 @@ def scrape_all_creators(
                         "Podcast scrape failed for %s (continuing)",
                         creator_label,
                     )
-            elif is_podcast_category and want_podcasts and settings.max_podcasts_per_channel > 0:
-                log.info(
-                    "Skipping podcasts for %s — no Podcasts tab on channel",
-                    creator_label,
-                )
             elif is_podcast_category and want_podcasts:
                 log.info(
                     "Skipping podcasts for %s — MAX_PODCASTS_PER_CHANNEL=0",

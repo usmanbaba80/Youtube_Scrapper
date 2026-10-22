@@ -161,6 +161,16 @@ def detect_channel_tabs_and_id(
         ",".join(sorted(tabs)) or "(none)",
         channel_id or "?",
     )
+    if not tabs and not channel_id:
+        title_match = re.search(r"<title>([^<]+)</title>", html, re.I)
+        title = (title_match.group(1).strip() if title_match else "")[:120]
+        log.warning(
+            "Channel page for %s had no tabs or channel id (title=%r, bytes=%s). "
+            "YouTube may have returned a consent or bot page.",
+            root,
+            title or "(none)",
+            len(html),
+        )
     return frozenset(tabs), channel_id, handle
 
 
@@ -172,6 +182,9 @@ def _session() -> requests.Session:
             "Accept-Language": "en-US,en;q=0.9",
         }
     )
+    # A consent wall has no channel tabs or channel id. These cookies skip it.
+    session.cookies.set("SOCS", "CAI", domain=".youtube.com")
+    session.cookies.set("CONSENT", "YES+", domain=".youtube.com")
     # Channel pages only. Does not change Bunny, Postgres, or other processes.
     from app.config import youtube_proxy_url
 
