@@ -15,6 +15,7 @@ load_dotenv(PROJECT_ROOT / ".env")
 # "Podcasts - PodVerse" uses podcast shows instead of channel playlists.
 PODCAST_CATEGORY_ID = 5
 MAX_PODCASTS_PER_CHANNEL = 3
+MAX_PODCAST_EPISODES = 20
 
 
 def _env(name: str, default: str = "") -> str:
@@ -86,6 +87,7 @@ class Settings:
     max_playlists_per_channel: int
     max_playlist_items: int
     max_podcasts_per_channel: int
+    max_podcast_episodes: int
     scrape_fetch_limit: int
     cookies_file: Path | None
     cookies_dir: Path | None
@@ -125,6 +127,7 @@ def load_settings() -> Settings:
     max_playlists = _env_int("MAX_PLAYLISTS_PER_CHANNEL", 10)
     max_playlist_items = _env_int("MAX_PLAYLIST_ITEMS", 100)
     max_podcasts = _env_int("MAX_PODCASTS_PER_CHANNEL", MAX_PODCASTS_PER_CHANNEL)
+    max_podcast_episodes = _env_int("MAX_PODCAST_EPISODES", MAX_PODCAST_EPISODES)
     # YouTube Shorts max length is 3 minutes; longer = mis-scraped long-form.
     max_short_duration = _env_int("MAX_SHORT_DURATION_SECONDS", 180)
     return Settings(
@@ -151,6 +154,7 @@ def load_settings() -> Settings:
         max_playlists_per_channel=max(0, min(max_playlists, 99)),
         max_playlist_items=max(1, min(max_playlist_items, 500)),
         max_podcasts_per_channel=max(0, min(max_podcasts, MAX_PODCASTS_PER_CHANNEL)),
+        max_podcast_episodes=max(1, min(max_podcast_episodes, MAX_PODCAST_EPISODES)),
         scrape_fetch_limit=max(max_videos + 80, 180),
         cookies_file=_optional_path("YTDLP_COOKIES"),
         cookies_dir=_optional_path("YTDLP_COOKIES_DIR"),

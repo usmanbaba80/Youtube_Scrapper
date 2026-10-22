@@ -436,7 +436,7 @@ def _store_podcast_episodes(
     shorts_by_yt: dict[str, Short],
 ) -> tuple[int, int]:
     """
-    Replace this show's episodes, same cap as playlist items.
+    Replace this show's episodes. At most ``max_podcast_episodes`` are stored.
 
     Returns (linked, unlinked). Linked episodes reuse an existing video or short.
     """
@@ -447,12 +447,14 @@ def _store_podcast_episodes(
         )
         return 0, 0
 
+    episode_limit = settings.max_podcast_episodes
     entries = fetch_playlist_items(
         settings.youtube_api_key,
         podcast.youtube_podcast_id,
-        limit=settings.max_playlist_items,
+        limit=episode_limit,
         title=podcast.title,
     )
+    entries = entries[:episode_limit]
     session.query(PodcastEpisode).filter_by(podcast_row_id=podcast.id).delete(
         synchronize_session="fetch"
     )
@@ -511,6 +513,7 @@ def _store_podcasts(
     rows: list[dict],
 ) -> int:
     """Upsert podcast shows and their episodes. Returns how many shows were stored."""
+    rows = rows[: settings.max_podcasts_per_channel]
     existing = {
         podcast.youtube_podcast_id: podcast
         for podcast in session.query(Podcast).filter_by(creator_row_id=creator.id).all()

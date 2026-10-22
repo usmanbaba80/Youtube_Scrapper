@@ -68,6 +68,18 @@ def main() -> int:
             extra_filters=(not_podcast_category,),
             uploaded_only=True,
         )
+        unlinked_only = PlaylistItem.reuse_source == "none"
+        p_unlinked = _counts_by_creator(
+            session,
+            PlaylistItem,
+            extra_filters=(not_podcast_category, unlinked_only),
+        )
+        p_unlinked_up = _counts_by_creator(
+            session,
+            PlaylistItem,
+            extra_filters=(not_podcast_category, unlinked_only),
+            uploaded_only=True,
+        )
         d_tot = _counts_by_creator(session, Podcast)
         # An episode is done when its own file is uploaded, or it reuses a video/short.
         e_tot = _counts_by_creator(session, PodcastEpisode)
@@ -81,7 +93,8 @@ def main() -> int:
 
         header = (
             f"{'id':4}  {'handle':<30}  {'videos':<10}  {'shorts':<10}  "
-            f"{'playlist_items':<16}  {'podcasts':<10}  episodes"
+            f"{'playlist_items':<16}  {'unlinked':<10}  {'pl_uploaded':<12}  "
+            f"{'podcasts':<10}  episodes"
         )
         print(header)
         print("-" * len(header))
@@ -91,6 +104,7 @@ def main() -> int:
             vt, vu = v_tot.get(cid, 0), v_up.get(cid, 0)
             st, su = sh_tot.get(cid, 0), sh_up.get(cid, 0)
             pt, pu = p_tot.get(cid, 0), p_up.get(cid, 0)
+            pun, puu = p_unlinked.get(cid, 0), p_unlinked_up.get(cid, 0)
             dt = d_tot.get(cid, 0)
             et, eu = e_tot.get(cid, 0), e_done.get(cid, 0)
             if vt + st + pt + dt + et == 0:
@@ -100,7 +114,9 @@ def main() -> int:
                 episodes_done = et > 0 and eu == et
             else:
                 episodes_done = eu == et
-            is_complete = vt == vu and st == su and pt == pu and episodes_done
+            # Linked playlist items reuse a video or short. Only unlinked
+            # items need their own upload.
+            is_complete = vt == vu and st == su and pun == puu and episodes_done
             if args.incomplete:
                 if is_complete:
                     continue
@@ -115,7 +131,8 @@ def main() -> int:
             episode_ratio = f"{eu}/{et}"
             print(
                 f"{cid:4}  {handle:<30}  {ratio:<10}  {shorts_ratio:<10}  "
-                f"{items_ratio:<16}  {podcast_ratio:<10}  {episode_ratio}"
+                f"{items_ratio:<16}  {pun:<10}  {puu:<12}  "
+                f"{podcast_ratio:<10}  {episode_ratio}"
             )
         print("-" * len(header))
         label = "Incomplete" if args.incomplete else "Complete"

@@ -3,7 +3,7 @@ from __future__ import annotations
 import logging
 import time
 
-from sqlalchemy import func
+from sqlalchemy import and_, func, or_
 from sqlalchemy.orm import Session, sessionmaker
 
 from app.config import Settings, reset_youtube_proxy
@@ -290,6 +290,55 @@ def print_status(session: Session) -> None:
         "  items unlinked (metadata only):",
         session.query(func.count(PlaylistItem.id)).filter(PlaylistItem.reuse_source == "none").scalar(),
     )
+    for status, count in _count_by(session, PlaylistItem, PlaylistItem.transfer_status):
+        print(f"  transfer {status or '(null)'}: {count}")
+    print(
+        "  bunny thumbnails:",
+        session.query(func.count(PlaylistItem.id))
+        .filter(
+            PlaylistItem.bunny_thumbnail_url.isnot(None),
+            PlaylistItem.bunny_thumbnail_url != "",
+        )
+        .scalar(),
+    )
+    uploaded_video_ids = session.query(Video.id).filter(Video.transfer_status == "uploaded")
+    uploaded_short_ids = session.query(Short.id).filter(Short.transfer_status == "uploaded")
+    print(
+        "  uploaded media (own or linked):",
+        session.query(func.count(PlaylistItem.id))
+        .filter(
+            or_(
+                PlaylistItem.transfer_status == "uploaded",
+                PlaylistItem.video_row_id.in_(uploaded_video_ids),
+                PlaylistItem.short_row_id.in_(uploaded_short_ids),
+            )
+        )
+        .scalar(),
+    )
+    own_thumb = and_(
+        PlaylistItem.bunny_thumbnail_url.isnot(None),
+        PlaylistItem.bunny_thumbnail_url != "",
+    )
+    video_thumbs = session.query(Video.id).filter(
+        Video.bunny_thumbnail_url.isnot(None),
+        Video.bunny_thumbnail_url != "",
+    )
+    short_thumbs = session.query(Short.id).filter(
+        Short.bunny_thumbnail_url.isnot(None),
+        Short.bunny_thumbnail_url != "",
+    )
+    print(
+        "  bunny thumbnails (own or linked):",
+        session.query(func.count(PlaylistItem.id))
+        .filter(
+            or_(
+                own_thumb,
+                PlaylistItem.video_row_id.in_(video_thumbs),
+                PlaylistItem.short_row_id.in_(short_thumbs),
+            )
+        )
+        .scalar(),
+    )
     print(
         "  playlist metadata pending:",
         session.query(func.count(Playlist.id)).filter(Playlist.metadata_status == "pending").scalar(),
@@ -297,6 +346,12 @@ def print_status(session: Session) -> None:
     print(
         "  playlist metadata fetched:",
         session.query(func.count(Playlist.id)).filter(Playlist.metadata_status == "fetched").scalar(),
+    )
+    print(
+        "  playlist bunny thumbnails:",
+        session.query(func.count(Playlist.id))
+        .filter(Playlist.bunny_thumbnail_url.isnot(None), Playlist.bunny_thumbnail_url != "")
+        .scalar(),
     )
 
     podcasts = session.query(func.count(Podcast.id)).scalar() or 0
